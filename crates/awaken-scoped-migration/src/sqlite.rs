@@ -4,9 +4,10 @@
 //! ledger DDL, and a per-bundle transaction. SQLite is single-writer, so its
 //! single-applier guard (P6) is the run transaction itself, opened with
 //! `BEGIN IMMEDIATE` to take the write lock before the ledger is read — the
-//! backend-neutral counterpart of the Postgres advisory lock. Unlike the
-//! Postgres shell there is no single-statement limit — `execute_batch` runs
-//! multi-statement migrations. The apply decision is delegated to [`crate::plan`].
+//! backend-neutral counterpart of the Postgres advisory lock. Migration bodies
+//! run through `execute_batch`, the simple-query path, so a body may contain
+//! multiple statements — mirroring the Postgres shell's `raw_sql`. The apply
+//! decision is delegated to [`crate::plan`].
 
 use std::collections::{BTreeMap, BTreeSet};
 
