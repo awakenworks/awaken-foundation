@@ -1,0 +1,26 @@
+# cargo-deny configuration.
+#
+# Foundation is permissively licensed and depended on by everything above it, so
+# its dependency graph must stay permissive — a copyleft dep here would
+# contaminate every consumer. Run with `cargo deny check`.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"

@@ -1,0 +1,25 @@
+[package]
+name = "awaken-sql-migration"
+description = "Backend-agnostic SQL schema migration ledger (bundles, checksums, fail-closed) with Postgres and SQLite runners"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+categories = ["database"]
+
+[dependencies]
+sha2 = "0.10"
+thiserror.workspace = true
+sqlx = { workspace = true, features = ["runtime-tokio", "postgres"], optional = true }
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+
+[features]
+default = []
+postgres = ["dep:sqlx"]
+sqlite = ["dep:rusqlite"]
+
+[lints]
+workspace = true
