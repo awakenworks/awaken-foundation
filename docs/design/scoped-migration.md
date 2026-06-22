@@ -218,6 +218,88 @@ finally gives the crate its second cross-product consumer (alongside
 - **No ORM / schema diffing.** Migrations are explicit SQL, not generated from a
   model. The crate is a *ledger and runner*, not a schema framework.
 
+## Best practices (every one is hook-verified)
+
+The rule is deliberate: **a "best practice" here is something a hook can verify.**
+A guideline that cannot be mechanically checked (e.g. "one logical change per
+migration") is review advice, not a listed practice. Every practice below maps to
+a check in the next section.
+
+1. **Migrations are immutable once committed.** Never edit or reorder a shipped
+   migration; only append new ones. Editing changes what a version means and
+   corrupts the ledger.
+2. **Destructive ops are deliberate.** A `DROP` / `TRUNCATE` / unqualified
+   `DELETE` must be explicitly acknowledged, never incidental — this is also how
+   *expand–contract* (add → backfill → tighten, never drop-and-readd) is enforced.
+3. **Deterministic statements — no conditional DDL.** No `IF NOT EXISTS`,
+   `IF EXISTS`, or `CREATE OR REPLACE`. The ledger already guarantees each
+   migration runs **exactly once**, so conditional DDL is redundant *and* harmful:
+   it branches on live DB state and **masks drift** — `CREATE TABLE IF NOT EXISTS`
+   silently passes when the ledger says "not applied" but the table already exists,
+   recording a lie; a bare `CREATE TABLE` fails loudly and surfaces the
+   inconsistency. The one legitimate `IF NOT EXISTS` is the ledger's own bootstrap,
+   which is crate-internal (and excluded from the hook's discovery).
+4. **Portable SQL by default.** Use the token vocabulary (`{prefix}`, `{json}`,
+   `{timestamptz}`, …) so one template serves both backends; raw dialect types only
+   via the escape hatch.
+5. **Readable, unique versions.** Zero-padded labels (`V0001`) within a bundle, no
+   duplicates.
+6. **Namespace every bundle; never cross scopes.** A bundle id is `<scope>.<unit>`
+   (`iam.authz`, `runtime.event_store`) and its DDL names only its own prefix.
+   Cross-scope references defeat the separable dimension (P5).
+
+## Validation hooks (what to add, where)
+
+Every practice is enforced by a hook. Most are a **commit-time** static check in
+the portable script below; the two that need the bundle *types* (version ordering
+across the ledger, cross-scope reference) are enforced by the crate's
+`MigrationBundle::new` validation, surfaced through the consumer's `cargo test` in
+a **pre-push** hook — still a hook, just a different layer.
+
+| Practice | Check | Hook | Layer |
+|---|---|---|---|
+| Immutability (1) | append-only: no edit/delete of a shipped line (diff) | `check_migrations.py --staged` | pre-commit |
+| Destructive (2) | added `DROP`/`TRUNCATE`/`DELETE`-no-`WHERE` needs a marker | `check_migrations.py` | pre-commit |
+| Deterministic (3) | added `IF NOT EXISTS` / `IF EXISTS` / `CREATE OR REPLACE` | `check_migrations.py` | pre-commit |
+| Portable SQL (4) | raw `JSONB`/`TIMESTAMPTZ`/`SERIAL`/`now()` outside the escape hatch | `check_migrations.py` | pre-commit |
+| Versions (5) | non-`V0001`-form or duplicate version label | `check_migrations.py` | pre-commit |
+| Drift (1) | recorded checksum ≠ recomputed | crate `plan()` fail-closed via `cargo test` | pre-push |
+| Ordering / cross-scope (5,6) | non-increasing version; DDL names another scope's prefix | crate `MigrationBundle::new` via `cargo test` | pre-push |
+
+### The portable commit hook
+
+This repo ships [`hooks/check_migrations.py`](../../hooks/check_migrations.py): a
+single, dependency-free Python file that **auto-discovers** a repo's migration
+files and enforces practices 1–5. It is built to be **dropped into any consuming
+repo and wired at commit time**, like the family's `check_adr_immutability.py`.
+
+- **Auto-discovery — no configuration.** A file is a migration file if it
+  *constructs* migrations (`MigrationBundle::new` / `bundle_from_statements` /
+  `Migration::new(` in a `.rs`, or a `.sql` on a migration path); the crate's own
+  implementation (anything *defining* `MigrationBundle` / `plan` / a
+  `MigrationRunner`) is excluded. A root `.migration-paths` file (globs) can *add*
+  paths but is never required.
+- **Modes.** `--audit` discovers and checks every migration file in the tree (CI /
+  first adoption); `--staged` / `--base REF` check the migration files in the diff
+  (pre-commit / pre-push); `--self-test` validates the checker.
+- **Wiring (lefthook):**
+  ```yaml
+  pre-commit:
+    commands:
+      migrations:
+        run: python3 scripts/ci/check_migrations.py --self-test && python3 scripts/ci/check_migrations.py --staged
+  pre-push:
+    commands:
+      migrations:
+        run: python3 scripts/ci/check_migrations.py --audit
+  ```
+
+Intentional exceptions are made reviewable by an in-diff marker
+(`migration-allow-edit`, `migration-allow-destructive`, `migration-allow-raw-sql`,
+`migration-allow-conditional`) rather than by disabling the hook. The two
+pre-push crate checks stay with the crate, since they need the bundle types and
+cannot be derived from a diff. See [`hooks/README.md`](../../hooks/README.md).
+
 ## Migration path
 
 1. Land the token-rendering core + template-checksum in the foundation crate
@@ -226,5 +308,12 @@ finally gives the crate its second cross-product consumer (alongside
 3. Switch `awaken-next`'s server/stores to the token form (or keep raw-SQL bundles
    via the escape hatch initially).
 4. Retire `awaken-iam`'s `store/migration.rs`; depend on this crate; move the
-   `iam.*` bundles over unchanged.
-5. Add the build-time lints (duplicate version, cross-scope prefix reference).
+   `iam.*` bundles over.
+5. **Rewrite existing bundles to deterministic DDL.** Today both `awaken-next` and
+   `awaken-iam` use `CREATE TABLE IF NOT EXISTS` in their bundles (a habit from
+   before the ledger guaranteed exactly-once). Drop the `IF NOT EXISTS`: the ledger
+   is the single idempotency mechanism, and a bare `CREATE` surfaces drift instead
+   of hiding it. The ledger's own bootstrap DDL keeps `IF NOT EXISTS` — it cannot
+   ledger its own creation.
+6. Add the build-time lints (duplicate version, cross-scope prefix reference) and
+   wire `check_migrations.py` into each consumer's hooks.
