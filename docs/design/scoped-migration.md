@@ -1,11 +1,15 @@
-# SQL migration — design review and target
+# Scoped migration — design review and target
 
-`awaken-sql-migration` is the backend-agnostic SQL schema migration ledger. This
-document reviews the **current** design (ported from the originating product), names its
-problems, and specifies the **target** design the foundation crate converges to.
+`awaken-scoped-migration` is the backend-agnostic ledger for **namespace-scoped,
+independent** SQL migrations. The name carries the intent: migrations are owned by
+a *scope* (a namespaced bundle) and each scope evolves independently — the
+property the rest of this document calls "separable and combinable". This document
+reviews the **current** design (ported from the originating product, where it was named
+`awaken-sql-migration`), names its problems, and specifies the **target** design
+the foundation crate converges to.
 
 The review is grounded in two real implementations: the ported crate
-(`crates/awaken-sql-migration`) and the common service's parallel
+(`crates/awaken-scoped-migration`) and the common service's parallel
 `store/migration.rs`. They disagree on the most important axis, and the
 convergence below resolves it by **taking the better idea from each**.
 
@@ -146,13 +150,28 @@ the rendered SQL differs per backend by design. Bundles needing genuinely
 backend-specific SQL remain possible as an escape hatch, but the default is
 write-once.
 
-### Versioning that does not collide on merge (fixes P3)
+### Versioning: readable labels, collision caught at build (fixes P3)
 
-Author versions as **monotonic timestamps** (e.g. `YYYYMMDDHHMMSS`) rather than
-hand-counted integers, so two branches almost never pick the same number, and a
-genuine clash is a mechanically detectable build-time lint (duplicate version in a
-bundle) rather than a surprise at deploy. The ledger still records the version;
-ordering is still strictly increasing within a bundle.
+There are two separable concerns here — **readability** and **collision
+resistance** — and a zero-padded label like `V0001` addresses only the first.
+
+- **Readability.** Versions are recorded and displayed as zero-padded labels
+  (`V0001`, `V0002`, …) rather than bare integers. This is the familiar
+  Flyway-style form, sorts lexically the way it reads, and is far more legible in
+  a ledger or a diff than `1`, `2`. Adopt it.
+- **Collision resistance.** Zero-padding does **not** fix P3: two branches that
+  each append still both pick `V0003`, exactly as they both picked `3`. The fix is
+  orthogonal to the label format — a **build-time uniqueness lint** that rejects a
+  bundle containing a duplicate version. That turns the merge collision into a
+  failing check at PR time instead of a surprise at deploy, while keeping the
+  human-readable sequential labels.
+
+So the target is **zero-padded sequential labels (`V0001`) plus a build-time
+duplicate-version lint** — readable *and* collision-safe — rather than ugly
+timestamp versions. The ledger still records the version and ordering stays
+strictly increasing within a bundle. (Timestamp versions remain a valid escape
+hatch for a bundle with many concurrent contributors, but they are not the
+default; readability wins for the common case.)
 
 ### Apply via the simple-query path on both backends (fixes P4)
 
