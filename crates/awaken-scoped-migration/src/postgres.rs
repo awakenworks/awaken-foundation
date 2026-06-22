@@ -24,7 +24,7 @@ impl PostgresMigrationRunner {
         Ok(Self {
             pool,
             ledger_table: format!("{prefix}_schema_migrations"),
-            applied_by: "awaken-sql-migration".to_string(),
+            applied_by: "awaken-scoped-migration".to_string(),
         })
     }
 

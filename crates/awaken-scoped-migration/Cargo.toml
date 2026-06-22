@@ -1,5 +1,5 @@
 [package]
-name = "awaken-sql-migration"
+name = "awaken-scoped-migration"
 description = "Backend-agnostic SQL schema migration ledger (bundles, checksums, fail-closed) with Postgres and SQLite runners"
 version.workspace = true
 edition.workspace = true

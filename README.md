@@ -15,8 +15,8 @@ domain or secrets**, and **depends on nothing above it**. See
 
 ```
 crates/
-  awaken-sql-migration   backend-agnostic SQL schema migration ledger (postgres/sqlite)
-xtask/                   foundation guardrail (no upward dependency)
+  awaken-scoped-migration   namespace-scoped, independent SQL migration ledger (postgres/sqlite)
+xtask/                      foundation guardrail (no upward dependency)
 ```
 
 Configuration is a shared **convention over `figment`**, not a crate — see

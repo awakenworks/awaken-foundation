@@ -1,3 +1,3 @@
 # Design
 
-- [SQL migration — design review and target](sql-migration.md)
+- [Scoped migration — design review and target](scoped-migration.md)

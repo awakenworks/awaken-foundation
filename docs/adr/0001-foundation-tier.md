@@ -32,8 +32,8 @@ the IAM common layer. A crate belongs here only when **all** hold:
 4. **Permissive.** MIT OR Apache-2.0, with `cargo deny` keeping the graph
    copyleft-free so every consumer can link it.
 
-The first members are `awaken-sql-migration` (promoted out of `awaken-next`, where
-it was mis-placed) and `awaken-config`.
+The first member is `awaken-scoped-migration` (promoted out of `awaken-next`, where
+it was mis-placed and named `awaken-sql-migration`).
 
 ## Consequences
 
