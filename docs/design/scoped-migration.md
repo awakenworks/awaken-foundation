@@ -209,6 +209,119 @@ depends on this crate, and keeps only its bundles (the `identity.*` token SQL). 
 finally gives the crate its second cross-product consumer (alongside
 the originating product's server/stores), satisfying the foundation's rule-of-three.
 
+## Target API and open decisions
+
+The sections above give direction; this one pins the concrete decisions an
+implementer would otherwise have to invent, so the work is unambiguous.
+
+### Token vocabulary (definitive)
+
+The closed set, ported from the common service. `{prefix}` is the per-database table prefix; the
+rest are type/value tokens. Adding a backend is a new column here, never a schema
+rewrite. Bundles use only these tokens; anything else is raw dialect SQL and the
+hook flags it (practice 4).
+
+| token | Postgres | SQLite |
+|---|---|---|
+| `{prefix}` | the configured prefix | the configured prefix |
+| `{json}` | `JSONB` | `TEXT` |
+| `{timestamptz}` | `TIMESTAMPTZ` | `TEXT` |
+| `{now}` | `now()` | `CURRENT_TIMESTAMP` |
+| `{blob}` | `BYTEA` | `BLOB` |
+| `{pk_autoinc}` | `BIGSERIAL PRIMARY KEY` | `INTEGER PRIMARY KEY AUTOINCREMENT` |
+
+### Where `Dialect` enters
+
+The `Migration` stores the **template** (token SQL), never rendered SQL. Rendering
+happens **at apply time** in the runner, which knows its dialect:
+`render(template, dialect) -> String`. So `Migration::new(version, description,
+template)` is unchanged in shape; the runner gains `Dialect` (a field set by the
+backend: `PostgresMigrationRunner` ⇒ `Postgres`, `SqliteMigrationRunner` ⇒
+`Sqlite`). `plan()` stays pure and operates on templates/checksums, never rendered
+SQL.
+
+### Version representation and checksum (decided)
+
+- **Type stays `i64`** for ordering and the ledger primary key — no type churn.
+  `V0001` is a **display label** derived from the integer
+  (`fn label(&self) -> String  // "V{:04}"`), used in the ledger's `description`
+  and in diagnostics. The ledger version column stays `BIGINT`.
+- **Checksum input is the template, pinned exactly** as
+  `SHA-256( label_bytes || 0x00 || template_bytes )` — dialect-independent by
+  construction, so the same migration verifies identically on Postgres and SQLite.
+  (`Migration::checksum()` changes from hashing raw SQL to hashing the template.)
+
+### Escape hatch for backend-specific SQL
+
+When a migration genuinely cannot be expressed in tokens, a constructor takes one
+body per dialect and **opts out of dialect-independence explicitly**:
+`Migration::per_dialect(version, description, postgres: impl Into<String>, sqlite:
+impl Into<String>)`. Such a migration is checksummed per the *selected* dialect's
+body (it is inherently not portable), and `plan()` treats it like any other once
+recorded. Token migrations remain the default and the norm.
+
+### Bundle independence — the precise rule (P5)
+
+A bundle's **scope** is the segment of its id before the first `.` (`identity` in
+`identity.authz`). All tables share the per-DB `{prefix}`, so ownership cannot be read
+from the prefix alone. The checked rule is therefore **reference-based**: a bundle
+may reference only tables it itself `CREATE`s (plus tables created by an earlier
+migration in the same bundle). The lint collects each bundle's created table
+names and rejects any `FROM`/`JOIN`/`REFERENCES`/`ALTER` naming a table outside
+that set. This is what actually keeps bundles separable; the `<scope>.<unit>` id is
+the human label, the reference rule is the enforcement.
+
+### Build-time lint entry point
+
+Consumers run one function in a `#[test]` (it is the pre-push layer of the hook
+table):
+
+```rust
+pub fn lint(bundles: &[MigrationBundle]) -> Result<(), MigrationError>;
+//  - unique, strictly-increasing versions within each bundle   (P3)
+//  - no cross-bundle table reference                            (P5)
+//  - distinct bundle ids
+```
+
+Per-bundle version/order validation already lives in `MigrationBundle::new`;
+`lint` adds the cross-bundle checks that need the whole set.
+
+### Single-applier guard (P6)
+
+The guard is a method on the backend, defaulting to a no-op for single-writer
+SQLite and an advisory lock for Postgres, modelled on the common service's `MigrationExecutor`:
+
+```rust
+fn acquire_applier_guard(&mut self) -> Result<(), MigrationError>;  // default: Ok(())
+```
+
+`run_bundle(s)` acquires it before reading the ledger and holds it across the
+apply transaction; it is released on every exit path (commit, drift, error) so a
+failed run never strands the lock. Postgres implements it with
+`pg_advisory_xact_lock`; SQLite uses the write transaction (`BEGIN IMMEDIATE`).
+
+### Self-versioned ledger (P7) — minimal now, full mechanism deferred
+
+Full meta-migration of the ledger is a bootstrap problem (the ledger cannot
+ledger its own creation) and is **not first-release-critical**. The minimal step
+taken now: the ledger DDL carries a `ledger_version INTEGER` marker and the runner
+asserts it matches the version it expects, failing closed on a mismatch. Evolving
+the ledger schema across versions is a follow-up; until then the ledger schema is
+frozen at v1. This is the one target item intentionally left partial.
+
+### Test acceptance criteria
+
+The convergence is "done" when these hold, mirroring the common service's suite:
+
+- `checksum` is identical for a token migration on Postgres and SQLite, while the
+  rendered SQL differs (dialect-independent identity).
+- A drifted recorded checksum fails closed in `plan()`.
+- Concurrent `run_bundle` from two connections applies each migration exactly once
+  (single-applier guard).
+- `lint` rejects: duplicate version, non-increasing version, cross-bundle table
+  reference, duplicate bundle id.
+- A `per_dialect` migration round-trips and is skipped on re-run.
+
 ## Non-goals (explicit stances)
 
 - **Forward-only, no down-migrations.** Neither implementation has rollback, and
