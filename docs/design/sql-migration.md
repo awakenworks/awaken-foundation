@@ -23,6 +23,27 @@ convergence below resolves it by **taking the better idea from each**.
 The two-layer split (pure decision core + dialect shell) is good and is kept. The
 problems are below.
 
+## What "separable and combinable" actually means
+
+The crate's reason to exist is **separable-and-combinable migrations**, and
+the originating product already uses it that way. The property is **two-dimensional**, not
+just "different services":
+
+- **Separable along the bundle dimension.** Inside one database, each store
+  module owns its own `MigrationBundle` with a namespaced id (`runtime.event_store`,
+  `runtime.outbox`, `gateway.session_store`, …) and its **own independent version
+  stream**. Adding a store module adds a bundle; it never touches another's
+  versions. A bundle must not hard-couple to another (a cross-bundle FK would
+  defeat splitting), so bundles compose in any subset.
+- **Combinable along the prefix dimension.** `with_prefix` isolates a whole schema
+  behind a table prefix and a per-prefix ledger (`{prefix}_schema_migrations`), so
+  several services' schemas coexist in one database — the same discipline the common service
+  applies with `with_prefix("identity")`.
+
+So: **bundles separate; prefixes combine.** That is the property the foundation
+crate must preserve, and the two problems most tied to it (P3, P5) are sharpened
+accordingly below.
+
 ## Problems
 
 ### P1 — SQL is dialect-bound, so portable schemas are written twice (the big one)
@@ -50,13 +71,16 @@ before rendering), so the recorded identity is dialect-independent: the same
 checksum on Postgres and SQLite, while the rendered SQL legitimately differs. The
 target adopts template-checksumming.
 
-### P3 — Manually-assigned `i64` versions invite merge collisions
+### P3 — Positional append-only versions collide on concurrent append
 
-Versions are author-assigned integers, strictly increasing per bundle. Two
-branches that each add "version 5" to the same bundle **collide at merge** —
-which is not hypothetical: the common service's integration hit exactly this (a duplicated
-`AUTHZ_0002`). The bundle validator catches it at *runtime*, but the design
-*invites* the collision. The target reduces this to a build-time, mechanically
+Versions are strictly increasing per bundle. In the originating product they are
+**positional and append-only** — `bundle_from_statements` assigns `index + 1`, and
+the contract is "only append at the end, never reorder/insert" (reordering changes
+a recorded version's SQL and fails closed at the checksum). That is sound for one
+author, but two branches that each append a statement both take the **same next
+version**, so they collide at merge — the same shape the common service's integration hit (a
+duplicated `AUTHZ_0002`). The bundle validator catches it at *runtime*; the design
+still *invites* it. The target makes the clash a build-time, mechanically
 detectable condition (see "Versioning" below).
 
 ### P4 — Hand-rolled single-statement SQL parser in the hot path
@@ -69,13 +93,16 @@ sitting on every migration. SQLite needs none of it (`execute_batch` runs
 multi-statement). The target removes the asymmetry — apply via the **simple-query
 path on both backends** so a migration body is just SQL, and delete the parser.
 
-### P5 — Bundle independence is asserted but not enforced
+### P5 — Bundle independence is convention, not an enforced invariant
 
-The design says bundles "carry no cross-bundle dependencies" and run in
-"registration order". Nothing enforces it: a bundle's SQL can reference another
-bundle's table and *appear* to work by registration-order luck, silently coupling
-two services that are supposed to be separable. The target makes independence a
-checked invariant, not a comment.
+Bundle independence is exactly what makes the **separable** dimension work, and
+the originating product relies on it today — namespaced bundle ids (`runtime.*`, `gateway.*`)
+and a "no cross-bundle FK" rule stated in comments. But nothing *enforces* it: a
+bundle's SQL can reference another bundle's table and *appear* to work by
+registration-order luck, silently coupling two units that are supposed to split
+apart. Since the whole value proposition rests on this, the target promotes it to
+a checked invariant (a bundle's DDL may not name another scope's prefix), not a
+comment.
 
 ### P6 — No single-applier guard for concurrent startup (esp. SQLite)
 
