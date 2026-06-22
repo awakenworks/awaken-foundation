@@ -13,7 +13,6 @@ publish = false
 
 [workspace.dependencies]
 # Foundation crates (path-resolved within this workspace).
-awaken-config = { path = "crates/awaken-config", version = "0.1.0-dev" }
 awaken-sql-migration = { path = "crates/awaken-sql-migration", version = "0.1.0-dev" }
 
 # Shared third-party dependencies. Members opt in via `<dep>.workspace = true`.

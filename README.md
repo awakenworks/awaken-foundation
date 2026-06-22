@@ -16,9 +16,12 @@ domain or secrets**, and **depends on nothing above it**. See
 ```
 crates/
   awaken-sql-migration   backend-agnostic SQL schema migration ledger (postgres/sqlite)
-  awaken-config          namespaced, layered configuration for composable services
 xtask/                   foundation guardrail (no upward dependency)
 ```
+
+Configuration is a shared **convention over `figment`**, not a crate — see
+[ADR-0002](docs/adr/0002-configuration-convention.md). A config crate is promoted
+only when duplication across services earns it (rule of three).
 
 ## Layering
 
