@@ -13,7 +13,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 
-use crate::{AppliedMigration, MigrationBundle, MigrationError, plan, sql_identifier};
+use crate::{
+    AppliedMigration, LEDGER_VERSION, MigrationBundle, MigrationError, check_ledger_version, plan,
+    sql_identifier,
+};
 
 /// SQLite-backed migration runner with a per-prefix ledger table.
 ///
@@ -22,6 +25,7 @@ use crate::{AppliedMigration, MigrationBundle, MigrationError, plan, sql_identif
 #[derive(Debug, Clone)]
 pub struct SqliteMigrationRunner {
     ledger_table: String,
+    meta_table: String,
     applied_by: String,
 }
 
@@ -30,6 +34,7 @@ impl SqliteMigrationRunner {
         let prefix = sql_identifier(prefix.as_ref())?;
         Ok(Self {
             ledger_table: format!("{prefix}_schema_migrations"),
+            meta_table: format!("{prefix}_schema_migrations_meta"),
             applied_by: "awaken-scoped-migration".to_string(),
         })
     }
@@ -63,6 +68,7 @@ impl SqliteMigrationRunner {
         bundle: &MigrationBundle,
     ) -> Result<Vec<AppliedMigration>, MigrationError> {
         self.ensure_ledger(conn)?;
+        self.assert_ledger_version(conn)?;
         // Open the run's transaction with `BEGIN IMMEDIATE` so the write lock is
         // taken *before* the ledger is read. This is the SQLite single-applier
         // guard (P6): two processes starting against the same database can no
@@ -158,7 +164,38 @@ impl SqliteMigrationRunner {
             self.ledger_table
         );
         conn.execute_batch(&sql)
-            .map_err(sqlite_error("sqlite_migration_ledger_schema"))
+            .map_err(sqlite_error("sqlite_migration_ledger_schema"))?;
+
+        // Companion marker table that stamps the ledger's own schema version.
+        // The ledger has no migration path of its own, so the version is carried
+        // here and asserted on every run rather than evolved in place.
+        let meta_sql = format!(
+            "CREATE TABLE IF NOT EXISTS {} (ledger_version INTEGER NOT NULL)",
+            self.meta_table
+        );
+        conn.execute_batch(&meta_sql)
+            .map_err(sqlite_error("sqlite_migration_meta_schema"))?;
+
+        // Seed exactly once: stamp a freshly created (empty) marker table with
+        // the current version. An already-stamped ledger is left untouched.
+        let seed_sql = format!(
+            "INSERT INTO {meta} (ledger_version)
+             SELECT ?1 WHERE NOT EXISTS (SELECT 1 FROM {meta})",
+            meta = self.meta_table
+        );
+        conn.execute(&seed_sql, rusqlite::params![LEDGER_VERSION])
+            .map_err(sqlite_error("sqlite_migration_meta_seed"))?;
+        Ok(())
+    }
+
+    /// Read the stamped ledger version and fail closed unless it matches the
+    /// version this runner expects.
+    fn assert_ledger_version(&self, conn: &Connection) -> Result<(), MigrationError> {
+        let sql = format!("SELECT ledger_version FROM {} LIMIT 1", self.meta_table);
+        let found: i64 = conn
+            .query_row(&sql, [], |row| row.get(0))
+            .map_err(sqlite_error("sqlite_migration_meta_read"))?;
+        check_ledger_version(&self.ledger_table, found)
     }
 
     fn applied_versions(
@@ -272,6 +309,54 @@ mod tests {
         assert!(matches!(
             runner.run_bundle(&conn, &changed).unwrap_err(),
             MigrationError::ChecksumMismatch { version: 1, .. }
+        ));
+    }
+
+    fn meta_row_count(conn: &Connection, runner: &SqliteMigrationRunner) -> i64 {
+        conn.query_row(
+            &format!("SELECT count(*) FROM {}", runner.meta_table),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn stamps_ledger_version_on_fresh_ledger() {
+        let conn = Connection::open_in_memory().unwrap();
+        let runner = SqliteMigrationRunner::with_prefix("awaken").unwrap();
+        runner.run_bundle(&conn, &bundle()).unwrap();
+
+        let version: i64 = conn
+            .query_row(
+                &format!("SELECT ledger_version FROM {}", runner.meta_table),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, LEDGER_VERSION);
+        // Seeded exactly once, and re-running does not duplicate the stamp.
+        assert_eq!(meta_row_count(&conn, &runner), 1);
+        runner.run_bundle(&conn, &bundle()).unwrap();
+        assert_eq!(meta_row_count(&conn, &runner), 1);
+    }
+
+    #[test]
+    fn fails_closed_on_ledger_version_mismatch() {
+        let conn = Connection::open_in_memory().unwrap();
+        let runner = SqliteMigrationRunner::with_prefix("awaken").unwrap();
+        runner.run_bundle(&conn, &bundle()).unwrap();
+
+        // Simulate a ledger written by a different migrator generation.
+        conn.execute(
+            &format!("UPDATE {} SET ledger_version = ?1", runner.meta_table),
+            rusqlite::params![LEDGER_VERSION + 1],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            runner.run_bundle(&conn, &bundle()).unwrap_err(),
+            MigrationError::LedgerVersionMismatch { found, .. } if found == LEDGER_VERSION + 1
         ));
     }
 

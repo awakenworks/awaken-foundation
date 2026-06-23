@@ -23,6 +23,32 @@ pub mod postgres;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
+/// Schema version of the ledger itself (its own bookkeeping tables), distinct
+/// from the per-bundle migration versions it records.
+///
+/// The ledger has no migration path of its own (it cannot ledger its own
+/// creation), so instead of evolving it in place the runner stamps a fresh
+/// ledger with this value and refuses to operate on a ledger stamped with any
+/// other — a different generation of the migrator wrote it, and silently reusing
+/// it could corrupt bookkeeping. The full meta-migration mechanism is deferred;
+/// until it exists the ledger schema is frozen at this version.
+pub const LEDGER_VERSION: i64 = 1;
+
+/// Fail closed unless the ledger's stamped version equals [`LEDGER_VERSION`].
+///
+/// Pure and backend-agnostic so both backend shells share one decision: each
+/// reads the stamped value with its own driver, then defers the verdict here.
+pub fn check_ledger_version(ledger_table: &str, found: i64) -> Result<(), MigrationError> {
+    if found == LEDGER_VERSION {
+        return Ok(());
+    }
+    Err(MigrationError::LedgerVersionMismatch {
+        ledger_table: ledger_table.to_string(),
+        expected: LEDGER_VERSION,
+        found,
+    })
+}
+
 /// One ordered SQL migration inside a named bundle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Migration {
@@ -468,6 +494,14 @@ pub enum MigrationError {
         expected: String,
         actual: String,
     },
+    #[error(
+        "ledger '{ledger_table}' is stamped version {found}, but this runner expects {expected}"
+    )]
+    LedgerVersionMismatch {
+        ledger_table: String,
+        expected: i64,
+        found: i64,
+    },
     /// A backend driver operation failed. The core never constructs this; each
     /// backend shell maps its driver error here so the error type stays
     /// dialect-agnostic.
@@ -804,6 +838,26 @@ mod plan_tests {
             err.to_string().contains("V0003"),
             "diagnostic should label the version: {err}"
         );
+    }
+
+    #[test]
+    fn ledger_version_check_accepts_expected() {
+        assert!(check_ledger_version("awaken_schema_migrations", LEDGER_VERSION).is_ok());
+    }
+
+    #[test]
+    fn ledger_version_check_fails_closed_on_mismatch() {
+        let err = check_ledger_version("awaken_schema_migrations", LEDGER_VERSION + 1).unwrap_err();
+        assert!(matches!(
+            err,
+            MigrationError::LedgerVersionMismatch {
+                expected,
+                found,
+                ledger_table,
+            } if expected == LEDGER_VERSION
+                && found == LEDGER_VERSION + 1
+                && ledger_table == "awaken_schema_migrations"
+        ));
     }
 
     #[test]
