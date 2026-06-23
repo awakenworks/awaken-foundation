@@ -51,22 +51,37 @@ impl Migration {
         self.version
     }
 
+    /// Human-readable, zero-padded version label (`V0001`).
+    ///
+    /// The stored [`version`](Self::version) stays an `i64` for ordering and the
+    /// ledger primary key; this is purely the display form — Flyway-style, sorts
+    /// the way it reads, and far more legible in a ledger row or a diagnostic
+    /// than a bare `1`. It is recorded in the ledger's `description` (see
+    /// [`ledger_description`](Self::ledger_description)), surfaced in error
+    /// messages, and used as the leading field of the [`checksum`](Self::checksum)
+    /// so reordering a recorded version fails closed.
+    #[must_use]
+    pub fn label(&self) -> String {
+        version_label(self.version)
+    }
+
     #[must_use]
     pub fn description(&self) -> &str {
         &self.description
     }
 
+    /// The description as recorded in the ledger row: the readable
+    /// [`label`](Self::label) followed by the human description (`"V0001 create
+    /// the event store"`), so a ledger scan reads the version label without
+    /// decoding the integer column.
+    #[must_use]
+    pub fn ledger_description(&self) -> String {
+        format!("{} {}", self.label(), self.description)
+    }
+
     #[must_use]
     pub fn sql(&self) -> &str {
         &self.sql
-    }
-
-    /// Human-readable, zero-padded version label (`V0001`), derived from the
-    /// integer version. Used in diagnostics and as the leading field of the
-    /// checksum so reordering a recorded version fails closed.
-    #[must_use]
-    pub fn label(&self) -> String {
-        format!("V{:04}", self.version)
     }
 
     /// Dialect-independent identity of the migration:
@@ -422,10 +437,10 @@ pub enum MigrationError {
     InvalidBundleId(String),
     #[error("invalid migration {version}: {reason}")]
     InvalidMigration { version: i64, reason: &'static str },
-    #[error("bundle '{bundle_id}' contains duplicate migration version {version}")]
+    #[error("bundle '{bundle_id}' contains duplicate migration version V{version:04}")]
     DuplicateMigrationVersion { bundle_id: String, version: i64 },
     #[error(
-        "bundle '{bundle_id}' migrations are not strictly increasing: {previous} then {current}"
+        "bundle '{bundle_id}' migrations are not strictly increasing: V{previous:04} then V{current:04}"
     )]
     InvalidMigrationOrder {
         bundle_id: String,
@@ -435,17 +450,17 @@ pub enum MigrationError {
     #[error("duplicate migration bundle '{0}'")]
     DuplicateBundle(String),
     #[error(
-        "bundle '{bundle_id}' migration {version} references table '{table}' that no migration in the bundle creates"
+        "bundle '{bundle_id}' migration V{version:04} references table '{table}' that no migration in the bundle creates"
     )]
     CrossBundleReference {
         bundle_id: String,
         version: i64,
         table: String,
     },
-    #[error("bundle '{bundle_id}' has unknown applied version {version}")]
+    #[error("bundle '{bundle_id}' has unknown applied version V{version:04}")]
     UnknownAppliedVersion { bundle_id: String, version: i64 },
     #[error(
-        "bundle '{bundle_id}' migration {version} checksum mismatch: expected {expected}, actual {actual}"
+        "bundle '{bundle_id}' migration V{version:04} checksum mismatch: expected {expected}, actual {actual}"
     )]
     ChecksumMismatch {
         bundle_id: String,
@@ -513,6 +528,17 @@ fn validate_bundle_id(bundle_id: &str) -> Result<(), MigrationError> {
         return Ok(());
     }
     Err(MigrationError::InvalidBundleId(bundle_id.to_string()))
+}
+
+/// Render a migration version as its zero-padded display label (`V0001`).
+///
+/// The integer remains the source of truth for ordering and the ledger primary
+/// key; this is only the readable form used in the ledger `description` and in
+/// diagnostics. A free function so callers holding only an `i64` (the ledger,
+/// error formatting) get the same label as [`Migration::label`].
+#[must_use]
+pub fn version_label(version: i64) -> String {
+    format!("V{version:04}")
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -747,6 +773,37 @@ mod plan_tests {
             lint(&[bundle]).unwrap_err(),
             MigrationError::CrossBundleReference { table, .. } if table == "{prefix}_elsewhere"
         ));
+    }
+
+    #[test]
+    fn version_renders_as_zero_padded_label() {
+        let m = Migration::new(1, "first", "CREATE TABLE a (id TEXT)").unwrap();
+        assert_eq!(m.label(), "V0001");
+        assert_eq!(version_label(42), "V0042");
+        // Wider versions keep all their digits rather than truncating.
+        assert_eq!(version_label(12_345), "V12345");
+    }
+
+    #[test]
+    fn ledger_description_prefixes_the_label() {
+        let m = Migration::new(7, "create the event store", "CREATE TABLE a (id TEXT)").unwrap();
+        assert_eq!(m.ledger_description(), "V0007 create the event store");
+    }
+
+    #[test]
+    fn diagnostics_use_the_readable_label() {
+        let err = MigrationBundle::new(
+            "runtime.core",
+            vec![
+                Migration::new(3, "a", "CREATE TABLE a (id TEXT)").unwrap(),
+                Migration::new(3, "b", "CREATE TABLE b (id TEXT)").unwrap(),
+            ],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("V0003"),
+            "diagnostic should label the version: {err}"
+        );
     }
 
     #[test]

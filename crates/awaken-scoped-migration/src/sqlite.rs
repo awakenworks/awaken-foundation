@@ -89,6 +89,9 @@ impl SqliteMigrationRunner {
                 .map_err(sqlite_error("sqlite_migration_apply"))?;
 
             let checksum = migration.checksum();
+            // The ledger records the readable `V0001`-labelled description so a
+            // ledger scan reads the version label without decoding the integer.
+            let description = migration.ledger_description();
             let insert_sql = format!(
                 "INSERT INTO {} (bundle_id, version, checksum, description, applied_by)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -100,7 +103,7 @@ impl SqliteMigrationRunner {
                     bundle.bundle_id(),
                     migration.version(),
                     checksum,
-                    migration.description(),
+                    description,
                     self.applied_by,
                 ],
             )
@@ -110,7 +113,7 @@ impl SqliteMigrationRunner {
                 bundle_id: bundle.bundle_id().to_string(),
                 version: migration.version(),
                 checksum,
-                description: migration.description().to_string(),
+                description,
             });
         }
 
@@ -231,6 +234,16 @@ mod tests {
         assert_eq!(first.len(), 2);
         assert!(table_exists(&conn, "a"));
         assert!(table_exists(&conn, "b"));
+        // The ledger records the readable label alongside the description.
+        assert_eq!(first[0].description, "V0001 create a");
+        let recorded: String = conn
+            .query_row(
+                "SELECT description FROM awaken_schema_migrations WHERE version = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(recorded, "V0001 create a");
 
         let second = runner.run_bundle(&conn, &bundle()).unwrap();
         assert!(second.is_empty());

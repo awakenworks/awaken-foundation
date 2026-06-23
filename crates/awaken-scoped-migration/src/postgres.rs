@@ -107,11 +107,14 @@ impl PostgresMigrationRunner {
                 self.ledger_table
             );
             let checksum = migration.checksum();
+            // The ledger records the readable `V0001`-labelled description so a
+            // ledger scan reads the version label without decoding the integer.
+            let description = migration.ledger_description();
             sqlx::query(&insert_sql)
                 .bind(bundle.bundle_id())
                 .bind(migration.version())
                 .bind(&checksum)
-                .bind(migration.description())
+                .bind(&description)
                 .bind(&self.applied_by)
                 .execute(&mut *tx)
                 .await
@@ -121,7 +124,7 @@ impl PostgresMigrationRunner {
                 bundle_id: bundle.bundle_id().to_string(),
                 version: migration.version(),
                 checksum,
-                description: migration.description().to_string(),
+                description,
             });
         }
 
