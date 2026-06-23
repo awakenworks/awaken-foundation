@@ -53,4 +53,12 @@ commit-msg:
 post-rewrite:
   commands:
     commit-shape:
-      run: 'true # rebased commits are validated on the next push'
+      # `use_stdin` forwards git's old->new SHA pairs to the command. Without it
+      # lefthook hands the script an empty, never-closed stdin, so
+      # `--rewrite-stdin` blocks forever and `git rebase` appears to hang.
+      use_stdin: true
+      run: |
+        if [ "{1}" != "rebase" ]; then
+          exit 0
+        fi
+        python3 scripts/ci/check_commit_shape.py --rewrite-stdin

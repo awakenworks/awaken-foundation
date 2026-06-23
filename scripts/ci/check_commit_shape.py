@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Validate a commit message against the project convention.
 
-Usage: check_commit_shape.py COMMIT_MSG_FILE
+Usage:
+  check_commit_shape.py COMMIT_MSG_FILE   validate one message file (commit-msg)
+  check_commit_shape.py --rewrite-stdin   validate rebased commits (post-rewrite)
 
 Format: ``<emoji> <type>(<scope>): <subject>``
 - at most 3 lines total — a subject, a blank line, and one body line. Keep the
@@ -19,6 +21,7 @@ foundation tier's line budget tighter (3 vs 4).
 from __future__ import annotations
 
 import re
+import subprocess
 import sys
 
 TYPES = (
@@ -62,48 +65,84 @@ PM_TERMS = re.compile(
 )
 
 
-def main(argv: list[str]) -> int:
-    if not argv:
-        print("check-commit-shape: missing commit message file", file=sys.stderr)
-        return 1
-
-    with open(argv[0], encoding="utf-8") as handle:
-        raw = handle.read()
-
-    lines = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+def validate_text(text: str, label: str = "commit message") -> list[str]:
+    """Return a list of violation strings for one commit message (empty = ok)."""
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     # Ignore comment lines git includes in the template, then trailing blanks.
     content = [ln for ln in lines if not ln.startswith("#")]
     while content and content[-1].strip() == "":
         content.pop()
     if not content:
-        print("check-commit-shape: empty commit message", file=sys.stderr)
-        return 1
+        return [f"{label}: empty commit message"]
 
     errors: list[str] = []
     header = content[0]
-    text = "\n".join(content)
+    body = "\n".join(content)
 
     if not HEADER.match(header):
         errors.append(
-            "header must be `<emoji> <type>(<scope>): <subject>` "
+            f"{label}: header must be `<emoji> <type>(<scope>): <subject>` "
             f"with type in {{{', '.join(TYPES)}}}"
         )
     if len(header) > 100:
-        errors.append(f"header is {len(header)} chars (max 100)")
+        errors.append(f"{label}: header is {len(header)} chars (max 100)")
     if len(content) > MAX_LINES:
         errors.append(
-            f"message is {len(content)} lines (max {MAX_LINES}): subject, a blank "
-            "line, then one body line — keep it terse"
+            f"{label}: message is {len(content)} lines (max {MAX_LINES}): subject, "
+            "a blank line, then one body line — keep it terse"
         )
     if len(content) > 1 and content[1].strip():
-        errors.append("leave a blank line between subject and body")
+        errors.append(f"{label}: leave a blank line between subject and body")
+    if FORBIDDEN.search(body):
+        errors.append(f"{label}: AI-generation or Co-Authored-By marker not allowed")
+    if EXTERNAL_TOOL.search(body):
+        errors.append(f"{label}: external-tool provenance marker not allowed (e.g. `via [Tool](url)`)")
+    if PM_TERMS.search(body):
+        errors.append(f"{label}: project-management term not allowed")
+    return errors
 
-    if FORBIDDEN.search(text):
-        errors.append("AI-generation or Co-Authored-By marker not allowed")
-    if EXTERNAL_TOOL.search(text):
-        errors.append("external-tool provenance marker not allowed (e.g. `via [Tool](url)`)")
-    if PM_TERMS.search(text):
-        errors.append("project-management term not allowed")
+
+def validate_file(path: str) -> list[str]:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return validate_text(handle.read(), path)
+    except OSError as exc:
+        return [f"{path}: cannot read commit message file: {exc}"]
+
+
+def validate_rewrite_stdin() -> list[str]:
+    """Validate the new commits of a rebase, read as old->new SHA pairs on stdin."""
+    # A TTY stdin would block forever (hook runner did not forward git's pairs);
+    # there is nothing to validate, so return cleanly instead of hanging.
+    if sys.stdin.isatty():
+        return []
+    errors: list[str] = []
+    for raw in sys.stdin:
+        parts = raw.split()
+        if len(parts) < 2:
+            continue
+        new_sha = parts[1]
+        result = subprocess.run(
+            ["git", "log", "-1", "--format=%B", new_sha],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout:
+            errors.extend(validate_text(result.stdout, new_sha))
+    return errors
+
+
+def main(argv: list[str]) -> int:
+    if not argv:
+        print("check-commit-shape: usage: COMMIT_MSG_FILE | --rewrite-stdin", file=sys.stderr)
+        return 1
+
+    if argv[0] == "--rewrite-stdin":
+        errors = validate_rewrite_stdin()
+    else:
+        errors = validate_file(argv[0])
 
     if errors:
         print("check-commit-shape:", file=sys.stderr)
