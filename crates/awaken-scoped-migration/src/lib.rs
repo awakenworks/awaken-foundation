@@ -61,9 +61,32 @@ impl Migration {
         &self.sql
     }
 
+    /// Human-readable, zero-padded version label (`V0001`), derived from the
+    /// integer version. Used in diagnostics and as the leading field of the
+    /// checksum so reordering a recorded version fails closed.
+    #[must_use]
+    pub fn label(&self) -> String {
+        format!("V{:04}", self.version)
+    }
+
+    /// Dialect-independent identity of the migration:
+    /// `SHA-256(label_bytes || 0x00 || template_bytes)`.
+    ///
+    /// The hash is taken over the neutral template (the stored token SQL),
+    /// never the per-dialect rendered SQL, so the same migration verifies to
+    /// the same checksum on Postgres and SQLite even though the SQL each
+    /// backend applies legitimately differs. The label is included so a
+    /// reordered version (same template, different position) is detected as
+    /// drift. The `0x00` separator keeps the label and template fields
+    /// unambiguous.
     #[must_use]
     pub fn checksum(&self) -> String {
-        sha256_hex(self.sql.as_bytes())
+        let label = self.label();
+        let mut input = Vec::with_capacity(label.len() + 1 + self.sql.len());
+        input.extend_from_slice(label.as_bytes());
+        input.push(0x00);
+        input.extend_from_slice(self.sql.as_bytes());
+        sha256_hex(&input)
     }
 
     /// Dialect-neutral validation. Statement-count and other driver-specific
@@ -296,6 +319,50 @@ fn sha256_hex(bytes: &[u8]) -> String {
             let _ = write!(&mut out, "{byte:02x}");
             out
         })
+}
+
+#[cfg(test)]
+mod checksum_tests {
+    use super::*;
+
+    #[test]
+    fn hashes_label_nul_then_template() {
+        let migration = Migration::new(1, "first", "CREATE TABLE a (id TEXT)").unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"V0001");
+        expected.push(0x00);
+        expected.extend_from_slice(b"CREATE TABLE a (id TEXT)");
+        assert_eq!(migration.checksum(), sha256_hex(&expected));
+    }
+
+    #[test]
+    fn label_is_zero_padded() {
+        assert_eq!(Migration::new(1, "x", "SELECT 1").unwrap().label(), "V0001");
+        assert_eq!(
+            Migration::new(4242, "x", "SELECT 1").unwrap().label(),
+            "V4242"
+        );
+    }
+
+    #[test]
+    fn checksum_is_dialect_independent_for_one_template() {
+        // The checksum is taken over the neutral template, never the rendered
+        // SQL, so the same migration verifies identically on every backend.
+        let template = "CREATE TABLE {prefix}_event (id {pk_autoinc}, payload {json})";
+        let a = Migration::new(7, "events", template).unwrap();
+        let b = Migration::new(7, "events", template).unwrap();
+        assert_eq!(a.checksum(), b.checksum());
+    }
+
+    #[test]
+    fn reordering_a_version_changes_the_checksum() {
+        // Same template, different version label ⇒ different identity, so a
+        // reordered recorded version fails closed in `plan()`.
+        let template = "CREATE TABLE a (id TEXT)";
+        let at_one = Migration::new(1, "x", template).unwrap();
+        let at_two = Migration::new(2, "x", template).unwrap();
+        assert_ne!(at_one.checksum(), at_two.checksum());
+    }
 }
 
 #[cfg(test)]
