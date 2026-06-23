@@ -217,6 +217,203 @@ pub fn plan<'a>(
     Ok(pending)
 }
 
+/// Build-time validation across a whole set of bundles, intended to run in a
+/// consumer's `#[test]` (the pre-push layer of the migration hook table).
+///
+/// It enforces the invariants that need the full set, not a single bundle:
+///
+/// - **unique, strictly-increasing versions within each bundle** — re-checks the
+///   per-bundle invariant [`MigrationBundle::new`] already guarantees, so `lint`
+///   is a single, sufficient entry point;
+/// - **distinct bundle ids** across the set;
+/// - **bundle independence** — a bundle's DDL may reference only tables it itself
+///   creates, so no bundle silently couples to another (a cross-bundle reference
+///   defeats the separable dimension the crate exists to provide).
+///
+/// The independence rule is reference-based: the lint collects the table names
+/// each bundle `CREATE`s, then rejects any `FROM`/`JOIN`/`REFERENCES`/`ALTER`
+/// naming a table outside that set.
+pub fn lint(bundles: &[MigrationBundle]) -> Result<(), MigrationError> {
+    let mut seen_ids = BTreeSet::new();
+    for bundle in bundles {
+        // Re-assert the per-bundle version invariants so `lint` is the one
+        // function a consumer needs to call.
+        bundle.validate()?;
+        if !seen_ids.insert(bundle.bundle_id()) {
+            return Err(MigrationError::DuplicateBundle(
+                bundle.bundle_id().to_string(),
+            ));
+        }
+        check_bundle_independence(bundle)?;
+    }
+    Ok(())
+}
+
+/// Reject a bundle that references any table it does not itself create. Tables
+/// share the per-database `{prefix}`, so ownership is read from what the bundle
+/// creates, not from the prefix: a bundle may reference only the tables created
+/// by its own migrations.
+fn check_bundle_independence(bundle: &MigrationBundle) -> Result<(), MigrationError> {
+    let scans = bundle
+        .migrations()
+        .iter()
+        .map(|migration| (migration.version(), scan_tables(migration.sql())))
+        .collect::<Vec<_>>();
+    let created = scans
+        .iter()
+        .flat_map(|(_, scan)| &scan.created)
+        .collect::<BTreeSet<_>>();
+    for (version, scan) in &scans {
+        for table in &scan.referenced {
+            if !created.contains(table) {
+                return Err(MigrationError::CrossBundleReference {
+                    bundle_id: bundle.bundle_id().to_string(),
+                    version: *version,
+                    table: table.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Tables a single migration body creates and references, harvested by a
+/// dependency-free SQL word scan. This is a build-time lint, never the apply
+/// hot path, so a lightweight tokenizer is deliberate.
+#[derive(Default)]
+struct TableScan {
+    created: Vec<String>,
+    referenced: Vec<String>,
+}
+
+/// Scan one SQL body for the tables it `CREATE`s and the tables it references via
+/// `FROM` / `JOIN` / `REFERENCES` / `ALTER TABLE`. Comments and string literals
+/// are skipped; identifiers are normalized so the same table compares equal
+/// regardless of case or quoting.
+fn scan_tables(sql: &str) -> TableScan {
+    let words = tokenize_words(sql);
+    let mut scan = TableScan::default();
+    let mut index = 0;
+    while index < words.len() {
+        match words[index].to_ascii_uppercase().as_str() {
+            "CREATE" if next_is(&words, index + 1, "TABLE") => {
+                let name = index + 2 + leading_count(&words, index + 2, &["IF", "NOT", "EXISTS"]);
+                if let Some(table) = words.get(name) {
+                    scan.created.push(normalize_table(table));
+                }
+                index = name + 1;
+            }
+            "ALTER" if next_is(&words, index + 1, "TABLE") => {
+                let name = index + 2 + leading_count(&words, index + 2, &["IF", "EXISTS", "ONLY"]);
+                if let Some(table) = words.get(name) {
+                    scan.referenced.push(normalize_table(table));
+                }
+                index = name + 1;
+            }
+            "FROM" | "JOIN" | "REFERENCES" => {
+                if let Some(table) = words.get(index + 1) {
+                    scan.referenced.push(normalize_table(table));
+                }
+                index += 2;
+            }
+            _ => index += 1,
+        }
+    }
+    scan
+}
+
+fn next_is(words: &[String], index: usize, keyword: &str) -> bool {
+    words
+        .get(index)
+        .is_some_and(|word| word.eq_ignore_ascii_case(keyword))
+}
+
+/// Count leading words at `index` that match one of `keywords` (case-insensitive),
+/// so noise like `IF NOT EXISTS` can be stepped over to reach the table name.
+fn leading_count(words: &[String], index: usize, keywords: &[&str]) -> usize {
+    let mut count = 0;
+    while let Some(word) = words.get(index + count) {
+        if keywords
+            .iter()
+            .any(|keyword| word.eq_ignore_ascii_case(keyword))
+        {
+            count += 1;
+        } else {
+            break;
+        }
+    }
+    count
+}
+
+/// Normalize a table token for comparison: drop any identifier quoting and
+/// lower-case it (SQL identifiers are case-insensitive). `{prefix}`-bearing
+/// names compare verbatim, which is what keeps templated bundles comparable.
+fn normalize_table(raw: &str) -> String {
+    raw.trim_matches('"').to_ascii_lowercase()
+}
+
+/// Split a SQL body into bare word runs, skipping `--`/`/* */` comments and
+/// `'...'` string literals and unwrapping `"..."` quoted identifiers. A word run
+/// is the identifier alphabet plus `{` `}` `.` so a templated name like
+/// `{prefix}_sessions` or a qualified `schema.table` stays a single token.
+fn tokenize_words(sql: &str) -> Vec<String> {
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let mut words = Vec::new();
+    let mut index = 0;
+    while index < len {
+        let byte = bytes[index];
+        if byte == b'-' && bytes.get(index + 1) == Some(&b'-') {
+            index += 2;
+            while index < len && bytes[index] != b'\n' {
+                index += 1;
+            }
+        } else if byte == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            index += 2;
+            while index + 1 < len && !(bytes[index] == b'*' && bytes[index + 1] == b'/') {
+                index += 1;
+            }
+            index = (index + 2).min(len);
+        } else if byte == b'\'' {
+            index += 1;
+            while index < len {
+                if bytes[index] == b'\'' {
+                    if bytes.get(index + 1) == Some(&b'\'') {
+                        index += 2;
+                        continue;
+                    }
+                    index += 1;
+                    break;
+                }
+                index += 1;
+            }
+        } else if byte == b'"' {
+            index += 1;
+            let start = index;
+            while index < len && bytes[index] != b'"' {
+                index += 1;
+            }
+            if start < index {
+                words.push(sql[start..index].to_string());
+            }
+            index += 1;
+        } else if is_word_byte(byte) {
+            let start = index;
+            while index < len && is_word_byte(bytes[index]) {
+                index += 1;
+            }
+            words.push(sql[start..index].to_string());
+        } else {
+            index += 1;
+        }
+    }
+    words
+}
+
+const fn is_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'{' | b'}' | b'.')
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum MigrationError {
     #[error("invalid SQL identifier prefix '{0}'")]
@@ -237,6 +434,14 @@ pub enum MigrationError {
     },
     #[error("duplicate migration bundle '{0}'")]
     DuplicateBundle(String),
+    #[error(
+        "bundle '{bundle_id}' migration {version} references table '{table}' that no migration in the bundle creates"
+    )]
+    CrossBundleReference {
+        bundle_id: String,
+        version: i64,
+        table: String,
+    },
     #[error("bundle '{bundle_id}' has unknown applied version {version}")]
     UnknownAppliedVersion { bundle_id: String, version: i64 },
     #[error(
@@ -419,6 +624,128 @@ mod plan_tests {
         assert!(matches!(
             plan(&b, &applied).unwrap_err(),
             MigrationError::UnknownAppliedVersion { version: 99, .. }
+        ));
+    }
+
+    #[test]
+    fn lint_accepts_independent_bundles() {
+        let runtime = MigrationBundle::new(
+            "runtime.core",
+            vec![
+                Migration::new(1, "users", "CREATE TABLE {prefix}_users (id {pk_autoinc})")
+                    .unwrap(),
+                Migration::new(
+                    2,
+                    "sessions",
+                    "CREATE TABLE {prefix}_sessions (id {pk_autoinc}, \
+                     user_id BIGINT REFERENCES {prefix}_users (id))",
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let gateway = MigrationBundle::new(
+            "gateway.audit",
+            vec![
+                Migration::new(
+                    1,
+                    "log",
+                    "CREATE TABLE {prefix}_audit_log (id {pk_autoinc})",
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        assert!(lint(&[runtime, gateway]).is_ok());
+    }
+
+    #[test]
+    fn lint_allows_intra_bundle_alter() {
+        let bundle = MigrationBundle::new(
+            "runtime.core",
+            vec![
+                Migration::new(1, "create", "CREATE TABLE {prefix}_jobs (id {pk_autoinc})")
+                    .unwrap(),
+                Migration::new(
+                    2,
+                    "extend",
+                    "ALTER TABLE {prefix}_jobs ADD COLUMN note TEXT",
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        assert!(lint(&[bundle]).is_ok());
+    }
+
+    #[test]
+    fn lint_rejects_duplicate_bundle_id() {
+        let one = MigrationBundle::new(
+            "runtime.core",
+            vec![Migration::new(1, "a", "CREATE TABLE {prefix}_a (id TEXT)").unwrap()],
+        )
+        .unwrap();
+        let two = MigrationBundle::new(
+            "runtime.core",
+            vec![Migration::new(1, "b", "CREATE TABLE {prefix}_b (id TEXT)").unwrap()],
+        )
+        .unwrap();
+        assert!(matches!(
+            lint(&[one, two]).unwrap_err(),
+            MigrationError::DuplicateBundle(id) if id == "runtime.core"
+        ));
+    }
+
+    #[test]
+    fn lint_rejects_cross_bundle_foreign_key() {
+        let owner = MigrationBundle::new(
+            "iam.identity",
+            vec![
+                Migration::new(1, "users", "CREATE TABLE {prefix}_users (id {pk_autoinc})")
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+        // authz reaches into identity's table via a foreign key — exactly the
+        // silent coupling the reference rule forbids.
+        let coupled = MigrationBundle::new(
+            "iam.authz",
+            vec![
+                Migration::new(
+                    1,
+                    "grants",
+                    "CREATE TABLE {prefix}_grants (id {pk_autoinc}, \
+                 user_id BIGINT REFERENCES {prefix}_users (id))",
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        assert!(matches!(
+            lint(&[owner, coupled]).unwrap_err(),
+            MigrationError::CrossBundleReference { bundle_id, version: 1, table }
+                if bundle_id == "iam.authz" && table == "{prefix}_users"
+        ));
+    }
+
+    #[test]
+    fn lint_rejects_cross_bundle_select() {
+        let bundle = MigrationBundle::new(
+            "runtime.core",
+            vec![
+                Migration::new(
+                    1,
+                    "seed",
+                    "CREATE TABLE {prefix}_a (id TEXT); \
+                 INSERT INTO {prefix}_a SELECT id FROM {prefix}_elsewhere",
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        assert!(matches!(
+            lint(&[bundle]).unwrap_err(),
+            MigrationError::CrossBundleReference { table, .. } if table == "{prefix}_elsewhere"
         ));
     }
 
