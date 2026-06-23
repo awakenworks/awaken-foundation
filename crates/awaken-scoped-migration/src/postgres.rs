@@ -39,6 +39,29 @@ impl PostgresMigrationRunner {
         &self.ledger_table
     }
 
+    /// Acquire the single-applier guard for a run (P6).
+    ///
+    /// Takes a transaction-scoped advisory lock keyed on the ledger table and
+    /// bundle id. Held across the ledger read and the apply, it makes exactly
+    /// one connection apply a pending bundle while the others wait, then verify
+    /// — closing the concurrent-startup TOCTOU. `pg_advisory_xact_lock` is
+    /// released automatically when the transaction commits or rolls back, so a
+    /// failed run never strands it. The backend-neutral counterpart on SQLite
+    /// is the `BEGIN IMMEDIATE` write lock; see `docs/design/scoped-migration.md`.
+    async fn acquire_applier_guard(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        bundle_id: &str,
+    ) -> Result<(), MigrationError> {
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))")
+            .bind(&self.ledger_table)
+            .bind(bundle_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(pg_error("postgres_migration_lock"))?;
+        Ok(())
+    }
+
     pub async fn run_bundle(
         &self,
         bundle: &MigrationBundle,
@@ -62,12 +85,11 @@ impl PostgresMigrationRunner {
             .await
             .map_err(pg_error("postgres_migration_begin"))?;
 
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))")
-            .bind(&self.ledger_table)
-            .bind(bundle.bundle_id())
-            .execute(&mut *tx)
-            .await
-            .map_err(pg_error("postgres_migration_lock"))?;
+        // Take the single-applier guard before reading the ledger and hold it
+        // across the apply (P6). It is released when this transaction commits or
+        // rolls back, on every exit path.
+        self.acquire_applier_guard(&mut tx, bundle.bundle_id())
+            .await?;
 
         let applied_versions = self.applied_versions(&mut tx, bundle.bundle_id()).await?;
         let pending = plan(bundle, &applied_versions)?;
