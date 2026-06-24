@@ -11,7 +11,7 @@ use sqlx::{PgPool, Row};
 
 use crate::{
     AppliedMigration, Dialect, LEDGER_VERSION, MigrationBundle, MigrationError,
-    check_ledger_version, plan, sql_identifier,
+    check_ledger_version, plan, render, sql_identifier,
 };
 
 /// The dialect this backend shell applies and checksums migrations under.
@@ -21,6 +21,7 @@ const DIALECT: Dialect = Dialect::Postgres;
 #[derive(Debug, Clone)]
 pub struct PostgresMigrationRunner {
     pool: PgPool,
+    prefix: String,
     ledger_table: String,
     meta_table: String,
     applied_by: String,
@@ -34,6 +35,7 @@ impl PostgresMigrationRunner {
             ledger_table: format!("{prefix}_schema_migrations"),
             meta_table: format!("{prefix}_schema_migrations_meta"),
             applied_by: "awaken-scoped-migration".to_string(),
+            prefix,
         })
     }
 
@@ -94,9 +96,13 @@ impl PostgresMigrationRunner {
 
         let mut applied = Vec::new();
         for migration in pending {
-            // `raw_sql` runs the simple-query path, so a migration body may
+            // Render the portable token template to Postgres SQL at apply time,
+            // then run it on the simple-query path so a migration body may
             // contain multiple statements, mirroring SQLite's `execute_batch`.
-            sqlx::raw_sql(migration.sql_for(DIALECT))
+            // The template (not the rendered SQL) is what `plan` checksums, so
+            // the recorded identity stays dialect-independent.
+            let sql = render(migration.sql_for(DIALECT), DIALECT, &self.prefix);
+            sqlx::raw_sql(&sql)
                 .execute(&mut *tx)
                 .await
                 .map_err(pg_error("postgres_migration_apply"))?;
