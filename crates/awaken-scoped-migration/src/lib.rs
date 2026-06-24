@@ -1151,6 +1151,30 @@ mod plan_tests {
             MigrationError::DuplicateMigrationVersion { version: 2, .. }
         ));
     }
+
+    #[test]
+    fn rejects_a_backwards_version_step() {
+        // Convergence acceptance, distinct from the duplicate-version case: a
+        // bundle whose versions step backwards (3 then 1) is not strictly
+        // increasing and fails closed, the ordering invariant the bundle
+        // re-asserts for the whole set.
+        let err = MigrationBundle::new(
+            "runtime.core",
+            vec![
+                Migration::new(3, "a", "CREATE TABLE a (id TEXT)").unwrap(),
+                Migration::new(1, "b", "CREATE TABLE b (id TEXT)").unwrap(),
+            ],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            MigrationError::InvalidMigrationOrder {
+                previous: 3,
+                current: 1,
+                ..
+            }
+        ));
+    }
 }
 
 #[cfg(test)]
