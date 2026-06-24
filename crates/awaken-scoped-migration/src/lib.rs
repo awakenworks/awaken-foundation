@@ -49,15 +49,44 @@ pub fn check_ledger_version(ledger_table: &str, found: i64) -> Result<(), Migrat
     })
 }
 
+/// The SQL dialect a backend runner targets.
+///
+/// Each backend shell knows its own dialect (`PostgresMigrationRunner` ⇒
+/// [`Postgres`](Dialect::Postgres), `SqliteMigrationRunner` ⇒
+/// [`Sqlite`](Dialect::Sqlite)) and threads it into [`plan`] and
+/// [`Migration::checksum_for`]. A portable migration resolves identically for
+/// every dialect; a [`Migration::per_dialect`] escape-hatch migration resolves
+/// to the selected dialect's body and checksum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    Postgres,
+    Sqlite,
+}
+
+/// A migration's SQL body.
+///
+/// The default is [`Portable`](MigrationBody::Portable): one dialect-neutral
+/// token template with the same checksum on every backend. The
+/// [`PerDialect`](MigrationBody::PerDialect) escape hatch carries one body per
+/// dialect and is checksummed per the *selected* dialect, opting out of
+/// dialect-independence explicitly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MigrationBody {
+    Portable(String),
+    PerDialect { postgres: String, sqlite: String },
+}
+
 /// One ordered SQL migration inside a named bundle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Migration {
     version: i64,
     description: String,
-    sql: String,
+    body: MigrationBody,
 }
 
 impl Migration {
+    /// A portable migration: one dialect-neutral token template, identical
+    /// checksum on every backend. This is the default and the norm.
     pub fn new(
         version: i64,
         description: impl Into<String>,
@@ -66,7 +95,34 @@ impl Migration {
         let migration = Self {
             version,
             description: description.into(),
-            sql: sql.into(),
+            body: MigrationBody::Portable(sql.into()),
+        };
+        migration.validate()?;
+        Ok(migration)
+    }
+
+    /// Escape hatch for SQL that genuinely cannot be expressed in the portable
+    /// token vocabulary: one body per dialect.
+    ///
+    /// Such a migration **opts out of dialect-independence explicitly** — it is
+    /// checksummed per the *selected* dialect's body (so its recorded identity
+    /// legitimately differs across backends) and is otherwise treated like any
+    /// other migration by [`plan`]. Portable [`Migration::new`] migrations
+    /// remain the default; reach for this only when the tokens cannot express
+    /// the statement.
+    pub fn per_dialect(
+        version: i64,
+        description: impl Into<String>,
+        postgres: impl Into<String>,
+        sqlite: impl Into<String>,
+    ) -> Result<Self, MigrationError> {
+        let migration = Self {
+            version,
+            description: description.into(),
+            body: MigrationBody::PerDialect {
+                postgres: postgres.into(),
+                sqlite: sqlite.into(),
+            },
         };
         migration.validate()?;
         Ok(migration)
@@ -84,8 +140,9 @@ impl Migration {
     /// the way it reads, and far more legible in a ledger row or a diagnostic
     /// than a bare `1`. It is recorded in the ledger's `description` (see
     /// [`ledger_description`](Self::ledger_description)), surfaced in error
-    /// messages, and used as the leading field of the [`checksum`](Self::checksum)
-    /// so reordering a recorded version fails closed.
+    /// messages, and used as the leading field of the
+    /// [`checksum_for`](Self::checksum_for) so reordering a recorded version
+    /// fails closed.
     #[must_use]
     pub fn label(&self) -> String {
         version_label(self.version)
@@ -105,28 +162,52 @@ impl Migration {
         format!("{} {}", self.label(), self.description)
     }
 
+    /// The SQL body this migration applies on `dialect`. A portable migration
+    /// returns the same template for every dialect; a [`Migration::per_dialect`]
+    /// one returns the dialect-specific body.
     #[must_use]
-    pub fn sql(&self) -> &str {
-        &self.sql
+    pub fn sql_for(&self, dialect: Dialect) -> &str {
+        match &self.body {
+            MigrationBody::Portable(sql) => sql,
+            MigrationBody::PerDialect { postgres, sqlite } => match dialect {
+                Dialect::Postgres => postgres,
+                Dialect::Sqlite => sqlite,
+            },
+        }
     }
 
-    /// Dialect-independent identity of the migration:
-    /// `SHA-256(label_bytes || 0x00 || template_bytes)`.
+    /// Every distinct SQL body this migration carries: one for a portable
+    /// migration, both dialect bodies for a [`Migration::per_dialect`] one. Used
+    /// by the dialect-agnostic build-time independence lint.
+    fn bodies(&self) -> Vec<&str> {
+        match &self.body {
+            MigrationBody::Portable(sql) => vec![sql.as_str()],
+            MigrationBody::PerDialect { postgres, sqlite } => {
+                vec![postgres.as_str(), sqlite.as_str()]
+            }
+        }
+    }
+
+    /// Recorded identity of the migration on `dialect`:
+    /// `SHA-256(label_bytes || 0x00 || body_bytes)`.
     ///
-    /// The hash is taken over the neutral template (the stored token SQL),
-    /// never the per-dialect rendered SQL, so the same migration verifies to
-    /// the same checksum on Postgres and SQLite even though the SQL each
-    /// backend applies legitimately differs. The label is included so a
-    /// reordered version (same template, different position) is detected as
-    /// drift. The `0x00` separator keeps the label and template fields
-    /// unambiguous.
+    /// For a portable migration the body is the neutral template, so the hash is
+    /// **dialect-independent**: the same migration verifies to the same checksum
+    /// on Postgres and SQLite even though the SQL each backend ultimately applies
+    /// may differ. For a [`Migration::per_dialect`] escape-hatch migration the
+    /// body is the selected dialect's SQL, so its recorded identity legitimately
+    /// differs across backends — that is the explicit cost of opting out of
+    /// dialect-independence. The label is included so a reordered version (same
+    /// body, different position) is detected as drift; the `0x00` separator keeps
+    /// the label and body fields unambiguous.
     #[must_use]
-    pub fn checksum(&self) -> String {
+    pub fn checksum_for(&self, dialect: Dialect) -> String {
         let label = self.label();
-        let mut input = Vec::with_capacity(label.len() + 1 + self.sql.len());
+        let body = self.sql_for(dialect);
+        let mut input = Vec::with_capacity(label.len() + 1 + body.len());
         input.extend_from_slice(label.as_bytes());
         input.push(0x00);
-        input.extend_from_slice(self.sql.as_bytes());
+        input.extend_from_slice(body.as_bytes());
         sha256_hex(&input)
     }
 
@@ -145,7 +226,10 @@ impl Migration {
                 reason: "description must not be blank",
             });
         }
-        if self.sql.trim().is_empty() {
+        // Every body a migration carries must be non-blank: a portable migration
+        // has one, a per-dialect escape hatch has one per dialect (a blank
+        // postgres or sqlite body is rejected).
+        if self.bodies().iter().any(|body| body.trim().is_empty()) {
             return Err(MigrationError::InvalidMigration {
                 version: self.version,
                 reason: "sql must not be blank",
@@ -230,17 +314,24 @@ pub struct AppliedMigration {
 /// Pure and backend-agnostic: it performs every interesting decision — unknown
 /// applied version, checksum drift, and already-applied skip — and returns the
 /// migrations to apply in order. A backend shell only fetches `applied`, calls
-/// this, and applies the result with its own driver.
+/// this with its own `dialect`, and applies the result with its own driver.
+///
+/// `dialect` selects which checksum a recorded migration is compared against: a
+/// portable migration's checksum is identical for every dialect, so this only
+/// matters for a [`Migration::per_dialect`] escape-hatch migration, whose
+/// recorded identity is per dialect. Otherwise a per-dialect migration is
+/// planned exactly like any other.
 pub fn plan<'a>(
     bundle: &'a MigrationBundle,
     applied: &BTreeMap<i64, String>,
+    dialect: Dialect,
 ) -> Result<Vec<&'a Migration>, MigrationError> {
     validate_applied_versions(bundle, applied)?;
     let mut pending = Vec::new();
     for migration in bundle.migrations() {
         match applied.get(&migration.version()) {
             Some(existing) => {
-                let recomputed = migration.checksum();
+                let recomputed = migration.checksum_for(dialect);
                 if existing != &recomputed {
                     return Err(MigrationError::ChecksumMismatch {
                         bundle_id: bundle.bundle_id().to_string(),
@@ -298,7 +389,18 @@ fn check_bundle_independence(bundle: &MigrationBundle) -> Result<(), MigrationEr
     let scans = bundle
         .migrations()
         .iter()
-        .map(|migration| (migration.version(), scan_tables(migration.sql())))
+        .map(|migration| {
+            // Scan every body a migration carries so a per-dialect escape hatch
+            // is held to the same independence rule on both dialects; a portable
+            // migration has a single body.
+            let mut scan = TableScan::default();
+            for body in migration.bodies() {
+                let body_scan = scan_tables(body);
+                scan.created.extend(body_scan.created);
+                scan.referenced.extend(body_scan.referenced);
+            }
+            (migration.version(), scan)
+        })
         .collect::<Vec<_>>();
     let created = scans
         .iter()
@@ -597,7 +699,10 @@ mod checksum_tests {
         expected.extend_from_slice(b"V0001");
         expected.push(0x00);
         expected.extend_from_slice(b"CREATE TABLE a (id TEXT)");
-        assert_eq!(migration.checksum(), sha256_hex(&expected));
+        assert_eq!(
+            migration.checksum_for(Dialect::Postgres),
+            sha256_hex(&expected)
+        );
     }
 
     #[test]
@@ -611,12 +716,71 @@ mod checksum_tests {
 
     #[test]
     fn checksum_is_dialect_independent_for_one_template() {
-        // The checksum is taken over the neutral template, never the rendered
-        // SQL, so the same migration verifies identically on every backend.
+        // The checksum of a portable migration is taken over the neutral
+        // template, so it verifies identically on every backend.
         let template = "CREATE TABLE {prefix}_event (id {pk_autoinc}, payload {json})";
-        let a = Migration::new(7, "events", template).unwrap();
-        let b = Migration::new(7, "events", template).unwrap();
-        assert_eq!(a.checksum(), b.checksum());
+        let migration = Migration::new(7, "events", template).unwrap();
+        assert_eq!(
+            migration.checksum_for(Dialect::Postgres),
+            migration.checksum_for(Dialect::Sqlite)
+        );
+    }
+
+    #[test]
+    fn per_dialect_checksum_differs_across_dialects() {
+        // The escape hatch opts out of dialect-independence: each dialect's body
+        // is hashed, so the recorded identity legitimately differs per backend.
+        let migration = Migration::per_dialect(
+            3,
+            "json column",
+            "ALTER TABLE t ADD COLUMN payload JSONB",
+            "ALTER TABLE t ADD COLUMN payload TEXT",
+        )
+        .unwrap();
+        let pg = migration.checksum_for(Dialect::Postgres);
+        let sqlite = migration.checksum_for(Dialect::Sqlite);
+        assert_ne!(pg, sqlite);
+
+        // Each side is exactly `SHA-256(label || 0x00 || that dialect's body)`.
+        let mut expected_pg = Vec::new();
+        expected_pg.extend_from_slice(b"V0003");
+        expected_pg.push(0x00);
+        expected_pg.extend_from_slice(b"ALTER TABLE t ADD COLUMN payload JSONB");
+        assert_eq!(pg, sha256_hex(&expected_pg));
+    }
+
+    #[test]
+    fn per_dialect_sql_selects_the_dialect_body() {
+        let migration = Migration::per_dialect(
+            1,
+            "now default",
+            "INSERT INTO t (at) VALUES (now())",
+            "INSERT INTO t (at) VALUES (CURRENT_TIMESTAMP)",
+        )
+        .unwrap();
+        assert_eq!(
+            migration.sql_for(Dialect::Postgres),
+            "INSERT INTO t (at) VALUES (now())"
+        );
+        assert_eq!(
+            migration.sql_for(Dialect::Sqlite),
+            "INSERT INTO t (at) VALUES (CURRENT_TIMESTAMP)"
+        );
+    }
+
+    #[test]
+    fn per_dialect_rejects_a_blank_body() {
+        // A per-dialect escape hatch must carry a real body for *each* dialect;
+        // a blank sqlite side fails closed at construction.
+        let err =
+            Migration::per_dialect(1, "broken", "CREATE TABLE a (id TEXT)", "   ").unwrap_err();
+        assert!(matches!(
+            err,
+            MigrationError::InvalidMigration {
+                version: 1,
+                reason: "sql must not be blank"
+            }
+        ));
     }
 
     #[test]
@@ -626,7 +790,10 @@ mod checksum_tests {
         let template = "CREATE TABLE a (id TEXT)";
         let at_one = Migration::new(1, "x", template).unwrap();
         let at_two = Migration::new(2, "x", template).unwrap();
-        assert_ne!(at_one.checksum(), at_two.checksum());
+        assert_ne!(
+            at_one.checksum_for(Dialect::Postgres),
+            at_two.checksum_for(Dialect::Postgres)
+        );
     }
 }
 
@@ -648,7 +815,7 @@ mod plan_tests {
     #[test]
     fn plans_all_when_ledger_empty() {
         let b = bundle();
-        let pending = plan(&b, &BTreeMap::new()).unwrap();
+        let pending = plan(&b, &BTreeMap::new(), Dialect::Postgres).unwrap();
         assert_eq!(
             pending.iter().map(|m| m.version()).collect::<Vec<_>>(),
             [1, 2]
@@ -659,8 +826,8 @@ mod plan_tests {
     fn skips_already_applied_with_matching_checksum() {
         let b = bundle();
         let mut applied = BTreeMap::new();
-        applied.insert(1, b.migrations()[0].checksum());
-        let pending = plan(&b, &applied).unwrap();
+        applied.insert(1, b.migrations()[0].checksum_for(Dialect::Postgres));
+        let pending = plan(&b, &applied, Dialect::Postgres).unwrap();
         assert_eq!(pending.iter().map(|m| m.version()).collect::<Vec<_>>(), [2]);
     }
 
@@ -669,7 +836,7 @@ mod plan_tests {
         let b = bundle();
         let mut applied = BTreeMap::new();
         applied.insert(1, "deadbeef".to_string());
-        let err = plan(&b, &applied).unwrap_err();
+        let err = plan(&b, &applied, Dialect::Postgres).unwrap_err();
         assert!(matches!(
             err,
             MigrationError::ChecksumMismatch { version: 1, expected, .. } if expected == "deadbeef"
@@ -682,8 +849,50 @@ mod plan_tests {
         let mut applied = BTreeMap::new();
         applied.insert(99, "x".to_string());
         assert!(matches!(
-            plan(&b, &applied).unwrap_err(),
+            plan(&b, &applied, Dialect::Postgres).unwrap_err(),
             MigrationError::UnknownAppliedVersion { version: 99, .. }
+        ));
+    }
+
+    #[test]
+    fn per_dialect_is_planned_then_skipped_like_any_migration() {
+        // Acceptance criterion: a per_dialect migration round-trips and is
+        // skipped on re-run, recorded under the running dialect's checksum.
+        let b = MigrationBundle::new(
+            "runtime.core",
+            vec![
+                Migration::new(1, "first", "CREATE TABLE a (id TEXT)").unwrap(),
+                Migration::per_dialect(
+                    2,
+                    "json column",
+                    "ALTER TABLE a ADD COLUMN payload JSONB",
+                    "ALTER TABLE a ADD COLUMN payload TEXT",
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        // Empty ledger ⇒ both pending, the escape hatch among them.
+        let pending = plan(&b, &BTreeMap::new(), Dialect::Sqlite).unwrap();
+        assert_eq!(
+            pending.iter().map(|m| m.version()).collect::<Vec<_>>(),
+            [1, 2]
+        );
+
+        // Record both under the SQLite-dialect checksums; the re-run skips them.
+        let mut applied = BTreeMap::new();
+        for migration in b.migrations() {
+            applied.insert(migration.version(), migration.checksum_for(Dialect::Sqlite));
+        }
+        assert!(plan(&b, &applied, Dialect::Sqlite).unwrap().is_empty());
+
+        // The same ledger fails closed under Postgres: the escape hatch's
+        // recorded identity is per dialect, so the SQLite checksum is drift there.
+        let err = plan(&b, &applied, Dialect::Postgres).unwrap_err();
+        assert!(matches!(
+            err,
+            MigrationError::ChecksumMismatch { version: 2, .. }
         ));
     }
 
