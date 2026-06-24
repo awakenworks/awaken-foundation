@@ -10,9 +10,12 @@ use std::collections::BTreeMap;
 use sqlx::{PgPool, Row};
 
 use crate::{
-    AppliedMigration, LEDGER_VERSION, MigrationBundle, MigrationError, check_ledger_version, plan,
-    sql_identifier,
+    AppliedMigration, Dialect, LEDGER_VERSION, MigrationBundle, MigrationError,
+    check_ledger_version, plan, sql_identifier,
 };
+
+/// The dialect this backend shell applies and checksums migrations under.
+const DIALECT: Dialect = Dialect::Postgres;
 
 /// PostgreSQL-backed migration runner with a per-prefix ledger table.
 #[derive(Debug, Clone)]
@@ -87,13 +90,13 @@ impl PostgresMigrationRunner {
             .await?;
 
         let applied_versions = self.applied_versions(&mut tx, bundle.bundle_id()).await?;
-        let pending = plan(bundle, &applied_versions)?;
+        let pending = plan(bundle, &applied_versions, DIALECT)?;
 
         let mut applied = Vec::new();
         for migration in pending {
             // `raw_sql` runs the simple-query path, so a migration body may
             // contain multiple statements, mirroring SQLite's `execute_batch`.
-            sqlx::raw_sql(migration.sql())
+            sqlx::raw_sql(migration.sql_for(DIALECT))
                 .execute(&mut *tx)
                 .await
                 .map_err(pg_error("postgres_migration_apply"))?;
@@ -103,7 +106,7 @@ impl PostgresMigrationRunner {
                  VALUES ($1, $2, $3, $4, $5)",
                 self.ledger_table
             );
-            let checksum = migration.checksum();
+            let checksum = migration.checksum_for(DIALECT);
             // The ledger records the readable `V0001`-labelled description so a
             // ledger scan reads the version label without decoding the integer.
             let description = migration.ledger_description();

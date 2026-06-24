@@ -14,9 +14,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 use crate::{
-    AppliedMigration, LEDGER_VERSION, MigrationBundle, MigrationError, check_ledger_version, plan,
-    sql_identifier,
+    AppliedMigration, Dialect, LEDGER_VERSION, MigrationBundle, MigrationError,
+    check_ledger_version, plan, sql_identifier,
 };
+
+/// The dialect this backend shell applies and checksums migrations under.
+const DIALECT: Dialect = Dialect::Sqlite;
 
 /// SQLite-backed migration runner with a per-prefix ledger table.
 ///
@@ -86,16 +89,16 @@ impl SqliteMigrationRunner {
         self.acquire_applier_guard()?;
 
         let applied_versions = self.applied_versions(&tx, bundle.bundle_id())?;
-        let pending = plan(bundle, &applied_versions)?;
+        let pending = plan(bundle, &applied_versions, DIALECT)?;
 
         let mut applied = Vec::new();
         for migration in pending {
             // `execute_batch` runs the simple-query path, so a migration body
             // may contain multiple statements.
-            tx.execute_batch(migration.sql())
+            tx.execute_batch(migration.sql_for(DIALECT))
                 .map_err(sqlite_error("sqlite_migration_apply"))?;
 
-            let checksum = migration.checksum();
+            let checksum = migration.checksum_for(DIALECT);
             // The ledger records the readable `V0001`-labelled description so a
             // ledger scan reads the version label without decoding the integer.
             let description = migration.ledger_description();
