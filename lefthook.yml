@@ -44,6 +44,8 @@ pre-push:
       run: python3 hooks/check_migrations.py --audit
     test:
       run: cargo test --workspace
+    coverage:
+      run: bash scripts/ci/check-coverage.sh
 
 commit-msg:
   commands:

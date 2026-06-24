@@ -1248,3 +1248,262 @@ mod render_tests {
         assert_ne!(pg, lite, "rendered SQL must differ per backend");
     }
 }
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_non_positive_version() {
+        // A version is the ledger primary key and the ordering field, so it must
+        // be positive; zero and negatives fail closed at construction.
+        for version in [0, -1] {
+            let err = Migration::new(version, "x", "CREATE TABLE a (id TEXT)").unwrap_err();
+            assert!(matches!(
+                err,
+                MigrationError::InvalidMigration {
+                    reason: "version must be positive",
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_blank_description() {
+        // A whitespace-only description is as good as none for a ledger scan.
+        let err = Migration::new(1, "   ", "CREATE TABLE a (id TEXT)").unwrap_err();
+        assert!(matches!(
+            err,
+            MigrationError::InvalidMigration {
+                version: 1,
+                reason: "description must not be blank"
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_blank_portable_body() {
+        // The portable counterpart of the per-dialect blank-body rejection.
+        let err = Migration::new(1, "x", "   ").unwrap_err();
+        assert!(matches!(
+            err,
+            MigrationError::InvalidMigration {
+                version: 1,
+                reason: "sql must not be blank"
+            }
+        ));
+    }
+
+    #[test]
+    fn accessors_expose_description_and_migrations() {
+        let migration = Migration::new(1, "create the store", "CREATE TABLE a (id TEXT)").unwrap();
+        assert_eq!(migration.description(), "create the store");
+        let bundle = MigrationBundle::new("runtime.core", vec![migration]).unwrap();
+        assert_eq!(bundle.bundle_id(), "runtime.core");
+        assert_eq!(bundle.migrations().len(), 1);
+        assert_eq!(bundle.migrations()[0].version(), 1);
+    }
+
+    #[test]
+    fn sql_identifier_accepts_valid_and_rejects_invalid() {
+        assert_eq!(sql_identifier("awaken_v2").unwrap(), "awaken_v2");
+        // Empty, a leading digit, and a disallowed byte each fail closed.
+        for bad in ["", "1leading", "has space", "dash-no"] {
+            assert!(matches!(
+                sql_identifier(bad).unwrap_err(),
+                MigrationError::InvalidSqlIdentifier(value) if value == bad
+            ));
+        }
+    }
+
+    #[test]
+    fn bundle_rejects_invalid_bundle_id() {
+        // Bundle ids allow `_-.` but must start with an alphanumeric and carry no
+        // other punctuation or whitespace.
+        for bad in ["", "-leading", "has space", "tab\tname"] {
+            let err = MigrationBundle::new(
+                bad,
+                vec![Migration::new(1, "x", "CREATE TABLE a (id TEXT)").unwrap()],
+            )
+            .unwrap_err();
+            assert!(matches!(
+                err,
+                MigrationError::InvalidBundleId(value) if value == bad
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tokenizer_tests {
+    use super::*;
+
+    #[test]
+    fn lint_steps_over_if_not_exists_and_if_exists() {
+        // `CREATE TABLE IF NOT EXISTS` and `ALTER TABLE IF EXISTS` carry keyword
+        // noise between the verb and the table name; the scan must step over it to
+        // resolve ownership, so an intra-bundle reference still validates.
+        let bundle = MigrationBundle::new(
+            "runtime.core",
+            vec![
+                Migration::new(
+                    1,
+                    "create",
+                    "CREATE TABLE IF NOT EXISTS {prefix}_jobs (id {pk_autoinc})",
+                )
+                .unwrap(),
+                Migration::new(
+                    2,
+                    "extend",
+                    "ALTER TABLE IF EXISTS {prefix}_jobs ADD COLUMN note TEXT",
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        assert!(lint(&[bundle]).is_ok());
+    }
+
+    #[test]
+    fn independence_scan_skips_comments_and_string_literals() {
+        // A foreign table named only inside a line comment, a block comment, or a
+        // string literal is not a real reference: the tokenizer drops all three,
+        // so the bundle that creates its own table validates clean.
+        let bundle = MigrationBundle::new(
+            "runtime.core",
+            vec![
+                Migration::new(
+                    1,
+                    "seed",
+                    "CREATE TABLE {prefix}_a (id TEXT, note TEXT); \
+                     -- maintenance note: do not FROM {prefix}_ghost_line\n\
+                     /* historical: once read FROM {prefix}_ghost_block */ \
+                     INSERT INTO {prefix}_a (id, note) \
+                     VALUES ('1', 'mentions FROM {prefix}_ghost_string')",
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        assert!(
+            lint(&[bundle]).is_ok(),
+            "tables named only in comments/strings must not count as references"
+        );
+    }
+
+    #[test]
+    fn independence_scan_unwraps_quoted_identifiers() {
+        // A quoted identifier is the same table as its bare form (case-folded), so
+        // a quoted self-reference resolves to the bundle's own created table.
+        let bundle = MigrationBundle::new(
+            "runtime.core",
+            vec![
+                Migration::new(
+                    1,
+                    "create",
+                    "CREATE TABLE awaken_users (id TEXT); \
+                     INSERT INTO awaken_users SELECT id FROM \"AWAKEN_USERS\"",
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        assert!(lint(&[bundle]).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod error_taxonomy_tests {
+    use super::*;
+
+    /// Every `MigrationError` variant renders a readable, field-bearing message:
+    /// the taxonomy is part of the crate's contract, so its `Display` is pinned.
+    #[test]
+    fn each_variant_formats_with_its_fields() {
+        let cases = [
+            (
+                MigrationError::InvalidSqlIdentifier("1bad".into()),
+                vec!["prefix", "1bad"],
+            ),
+            (
+                MigrationError::InvalidBundleId("-bad".into()),
+                vec!["bundle id", "-bad"],
+            ),
+            (
+                MigrationError::InvalidMigration {
+                    version: 2,
+                    reason: "version must be positive",
+                },
+                vec!["invalid migration 2", "version must be positive"],
+            ),
+            (
+                MigrationError::DuplicateMigrationVersion {
+                    bundle_id: "runtime.core".into(),
+                    version: 3,
+                },
+                vec!["runtime.core", "V0003"],
+            ),
+            (
+                MigrationError::InvalidMigrationOrder {
+                    bundle_id: "runtime.core".into(),
+                    previous: 3,
+                    current: 1,
+                },
+                vec!["V0003", "V0001"],
+            ),
+            (
+                MigrationError::DuplicateBundle("runtime.core".into()),
+                vec!["duplicate", "runtime.core"],
+            ),
+            (
+                MigrationError::CrossBundleReference {
+                    bundle_id: "iam.authz".into(),
+                    version: 1,
+                    table: "{prefix}_users".into(),
+                },
+                vec!["iam.authz", "V0001", "{prefix}_users"],
+            ),
+            (
+                MigrationError::UnknownAppliedVersion {
+                    bundle_id: "runtime.core".into(),
+                    version: 9,
+                },
+                vec!["unknown applied version", "V0009"],
+            ),
+            (
+                MigrationError::ChecksumMismatch {
+                    bundle_id: "runtime.core".into(),
+                    version: 1,
+                    expected: "aaaa".into(),
+                    actual: "bbbb".into(),
+                },
+                vec!["checksum mismatch", "aaaa", "bbbb"],
+            ),
+            (
+                MigrationError::LedgerVersionMismatch {
+                    ledger_table: "awaken_schema_migrations".into(),
+                    expected: 1,
+                    found: 2,
+                },
+                vec!["awaken_schema_migrations", "1", "2"],
+            ),
+            (
+                MigrationError::Backend {
+                    operation: "sqlite_migration_apply",
+                    message: "syntax error".into(),
+                },
+                vec!["sqlite_migration_apply", "syntax error"],
+            ),
+        ];
+        for (error, fragments) in cases {
+            let rendered = error.to_string();
+            for fragment in fragments {
+                assert!(
+                    rendered.contains(fragment),
+                    "`{rendered}` should contain `{fragment}`"
+                );
+            }
+        }
+    }
+}

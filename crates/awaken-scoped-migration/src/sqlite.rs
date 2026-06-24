@@ -480,4 +480,92 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, MigrationError::DuplicateBundle(id) if id == "runtime.core"));
     }
+
+    #[test]
+    fn runs_multiple_distinct_bundles_in_order() {
+        // The happy path of `run_bundles`: two independently-versioned bundles
+        // share one database and both apply, in registration order.
+        let conn = Connection::open_in_memory().unwrap();
+        let runner = SqliteMigrationRunner::with_prefix("awaken").unwrap();
+        let core = bundle();
+        let audit = MigrationBundle::new(
+            "gateway.audit",
+            vec![
+                Migration::new(1, "create log", "CREATE TABLE log (id TEXT PRIMARY KEY)").unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let applied = runner.run_bundles(&conn, &[core, audit]).unwrap();
+        // Two from runtime.core plus one from gateway.audit, recorded under each
+        // bundle id.
+        assert_eq!(applied.len(), 3);
+        assert_eq!(applied[2].bundle_id, "gateway.audit");
+        assert!(table_exists(&conn, "a"));
+        assert!(table_exists(&conn, "b"));
+        assert!(table_exists(&conn, "log"));
+    }
+
+    #[test]
+    fn records_the_configured_applied_by() {
+        // `with_applied_by` overrides the actor stamped into every ledger row, and
+        // `ledger_table` reports the per-prefix table the rows land in.
+        let conn = Connection::open_in_memory().unwrap();
+        let runner = SqliteMigrationRunner::with_prefix("awaken")
+            .unwrap()
+            .with_applied_by("control-plane");
+        assert_eq!(runner.ledger_table(), "awaken_schema_migrations");
+        runner.run_bundle(&conn, &bundle()).unwrap();
+
+        let applied_by: String = conn
+            .query_row(
+                &format!(
+                    "SELECT applied_by FROM {} WHERE version = 1",
+                    runner.ledger_table()
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(applied_by, "control-plane");
+    }
+
+    #[test]
+    fn releases_the_applier_guard_on_the_error_path() {
+        // A migration whose body is invalid SQL passes construction (non-blank)
+        // but fails at apply, surfacing a Backend error. The run transaction —
+        // which is the SQLite single-applier guard (P6) — must roll back and
+        // release the write lock on that error path, leaving no ledger rows and
+        // no partial table, so a subsequent valid run on the same connection is
+        // not blocked by a stranded lock.
+        let conn = Connection::open_in_memory().unwrap();
+        let runner = SqliteMigrationRunner::with_prefix("awaken").unwrap();
+
+        let broken = MigrationBundle::new(
+            "runtime.core",
+            vec![Migration::new(1, "broken", "THIS IS NOT VALID SQL").unwrap()],
+        )
+        .unwrap();
+        let err = runner.run_bundle(&conn, &broken).unwrap_err();
+        assert!(matches!(
+            err,
+            MigrationError::Backend {
+                operation: "sqlite_migration_apply",
+                ..
+            }
+        ));
+
+        // The guard was released, not stranded: the ledger is empty and a fresh,
+        // valid bundle applies cleanly on the very same connection.
+        let ledger_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM awaken_schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(ledger_rows, 0);
+
+        let applied = runner.run_bundle(&conn, &bundle()).unwrap();
+        assert_eq!(applied.len(), 2);
+        assert!(table_exists(&conn, "a"));
+    }
 }
