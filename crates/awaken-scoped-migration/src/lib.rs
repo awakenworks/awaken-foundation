@@ -63,6 +63,73 @@ pub enum Dialect {
     Sqlite,
 }
 
+impl Dialect {
+    /// `{json}` column type: structured JSON storage.
+    const fn json(self) -> &'static str {
+        match self {
+            Self::Postgres => "JSONB",
+            Self::Sqlite => "TEXT",
+        }
+    }
+
+    /// `{timestamptz}` column type: an instant with time-zone semantics.
+    const fn timestamptz(self) -> &'static str {
+        match self {
+            Self::Postgres => "TIMESTAMPTZ",
+            Self::Sqlite => "TEXT",
+        }
+    }
+
+    /// `{now}` value expression: the current instant at statement time.
+    const fn now(self) -> &'static str {
+        match self {
+            Self::Postgres => "now()",
+            Self::Sqlite => "CURRENT_TIMESTAMP",
+        }
+    }
+
+    /// `{blob}` column type: opaque binary bytes.
+    const fn blob(self) -> &'static str {
+        match self {
+            Self::Postgres => "BYTEA",
+            Self::Sqlite => "BLOB",
+        }
+    }
+
+    /// `{pk_autoinc}` column clause: an auto-incrementing integer primary key.
+    const fn pk_autoinc(self) -> &'static str {
+        match self {
+            Self::Postgres => "BIGSERIAL PRIMARY KEY",
+            Self::Sqlite => "INTEGER PRIMARY KEY AUTOINCREMENT",
+        }
+    }
+}
+
+/// Render a portable token template to backend SQL for `dialect`.
+///
+/// A migration body is a dialect-neutral template carrying the closed token
+/// vocabulary — `{prefix}` for the per-database table prefix and a small type
+/// vocabulary (`{json}`, `{timestamptz}`, `{now}`, `{blob}`, `{pk_autoinc}`).
+/// Each token resolves to its backend form per the definitive table in
+/// `docs/design/scoped-migration.md`, so one template serves both backends.
+///
+/// Rendering happens at **apply time** in the runner, which knows its own
+/// `dialect` and `prefix`; the stored template and its
+/// [`Migration::checksum_for`] stay over the template, so a portable migration's
+/// recorded identity is dialect-independent while the rendered SQL legitimately
+/// differs. Any other `{...}` sequence is not a token and passes through
+/// untouched — it is raw dialect SQL the author wrote deliberately.
+#[must_use]
+pub fn render(template: &str, dialect: Dialect, prefix: &str) -> String {
+    template
+        .replace("{prefix}", prefix)
+        .replace("{json}", dialect.json())
+        .replace("{timestamptz}", dialect.timestamptz())
+        .replace("{now}", dialect.now())
+        .replace("{blob}", dialect.blob())
+        .replace("{pk_autoinc}", dialect.pk_autoinc())
+}
+
 /// A migration's SQL body.
 ///
 /// The default is [`Portable`](MigrationBody::Portable): one dialect-neutral
@@ -1083,5 +1150,77 @@ mod plan_tests {
             err,
             MigrationError::DuplicateMigrationVersion { version: 2, .. }
         ));
+    }
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+
+    const TEMPLATE: &str = "CREATE TABLE {prefix}_event (\n    \
+        id {pk_autoinc},\n    \
+        payload {json} NOT NULL,\n    \
+        body {blob},\n    \
+        created_at {timestamptz} NOT NULL DEFAULT {now}\n)";
+
+    #[test]
+    fn renders_every_token_for_postgres() {
+        let sql = render(TEMPLATE, Dialect::Postgres, "awaken");
+        assert!(sql.contains("CREATE TABLE awaken_event ("));
+        assert!(sql.contains("id BIGSERIAL PRIMARY KEY,"));
+        assert!(sql.contains("payload JSONB NOT NULL,"));
+        assert!(sql.contains("body BYTEA,"));
+        assert!(sql.contains("created_at TIMESTAMPTZ NOT NULL DEFAULT now()"));
+        // No token survives rendering.
+        assert!(!sql.contains('{'));
+    }
+
+    #[test]
+    fn renders_every_token_for_sqlite() {
+        let sql = render(TEMPLATE, Dialect::Sqlite, "awaken");
+        assert!(sql.contains("CREATE TABLE awaken_event ("));
+        assert!(sql.contains("id INTEGER PRIMARY KEY AUTOINCREMENT,"));
+        assert!(sql.contains("payload TEXT NOT NULL,"));
+        assert!(sql.contains("body BLOB,"));
+        assert!(sql.contains("created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"));
+        assert!(!sql.contains('{'));
+    }
+
+    #[test]
+    fn prefix_token_uses_runner_prefix() {
+        assert!(
+            render("SELECT * FROM {prefix}_t", Dialect::Sqlite, "gateway").contains("gateway_t")
+        );
+    }
+
+    #[test]
+    fn unknown_token_passes_through_untouched() {
+        // Anything outside the closed vocabulary is raw SQL the author wrote
+        // deliberately, not a token, so rendering leaves it exactly as-is.
+        let out = render("CREATE TABLE t (x {unknown})", Dialect::Postgres, "awaken");
+        assert_eq!(out, "CREATE TABLE t (x {unknown})");
+    }
+
+    #[test]
+    fn checksum_is_dialect_independent_while_rendered_sql_differs() {
+        let migration = Migration::new(1, "create event", TEMPLATE).unwrap();
+        // The recorded identity is the template's checksum — identical regardless
+        // of which backend later renders it.
+        assert_eq!(
+            migration.checksum_for(Dialect::Postgres),
+            migration.checksum_for(Dialect::Sqlite),
+        );
+        // Yet the SQL each backend ultimately applies differs by design.
+        let pg = render(
+            migration.sql_for(Dialect::Postgres),
+            Dialect::Postgres,
+            "awaken",
+        );
+        let lite = render(
+            migration.sql_for(Dialect::Sqlite),
+            Dialect::Sqlite,
+            "awaken",
+        );
+        assert_ne!(pg, lite, "rendered SQL must differ per backend");
     }
 }

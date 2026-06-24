@@ -15,7 +15,7 @@ use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 use crate::{
     AppliedMigration, Dialect, LEDGER_VERSION, MigrationBundle, MigrationError,
-    check_ledger_version, plan, sql_identifier,
+    check_ledger_version, plan, render, sql_identifier,
 };
 
 /// The dialect this backend shell applies and checksums migrations under.
@@ -27,6 +27,7 @@ const DIALECT: Dialect = Dialect::Sqlite;
 /// `spawn_blocking` closure with a borrowed connection.
 #[derive(Debug, Clone)]
 pub struct SqliteMigrationRunner {
+    prefix: String,
     ledger_table: String,
     meta_table: String,
     applied_by: String,
@@ -39,6 +40,7 @@ impl SqliteMigrationRunner {
             ledger_table: format!("{prefix}_schema_migrations"),
             meta_table: format!("{prefix}_schema_migrations_meta"),
             applied_by: "awaken-scoped-migration".to_string(),
+            prefix,
         })
     }
 
@@ -93,9 +95,12 @@ impl SqliteMigrationRunner {
 
         let mut applied = Vec::new();
         for migration in pending {
-            // `execute_batch` runs the simple-query path, so a migration body
-            // may contain multiple statements.
-            tx.execute_batch(migration.sql_for(DIALECT))
+            // Render the portable token template to SQLite SQL at apply time,
+            // then run it on the simple-query path so a migration body may
+            // contain multiple statements. The template (not the rendered SQL)
+            // is what `plan` checksums, keeping the recorded identity portable.
+            let sql = render(migration.sql_for(DIALECT), DIALECT, &self.prefix);
+            tx.execute_batch(&sql)
                 .map_err(sqlite_error("sqlite_migration_apply"))?;
 
             let checksum = migration.checksum_for(DIALECT);
@@ -288,6 +293,52 @@ mod tests {
 
         let second = runner.run_bundle(&conn, &bundle()).unwrap();
         assert!(second.is_empty());
+    }
+
+    #[test]
+    fn renders_portable_tokens_at_apply_time() {
+        // A portable token template is rendered to SQLite SQL when applied: the
+        // runner threads its own dialect and prefix into `render`, so the bundle
+        // author never writes `INTEGER PRIMARY KEY AUTOINCREMENT` or the table
+        // prefix by hand.
+        let conn = Connection::open_in_memory().unwrap();
+        let runner = SqliteMigrationRunner::with_prefix("gateway").unwrap();
+        let bundle = MigrationBundle::new(
+            "runtime.tokens",
+            vec![
+                Migration::new(
+                    1,
+                    "create event",
+                    "CREATE TABLE {prefix}_event (\
+                        id {pk_autoinc}, \
+                        payload {json} NOT NULL, \
+                        body {blob}, \
+                        created_at {timestamptz} NOT NULL DEFAULT {now})",
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let applied = runner.run_bundle(&conn, &bundle).unwrap();
+        assert_eq!(applied.len(), 1);
+        // The `{prefix}` token rendered to the runner's prefix, creating the
+        // prefixed table; no `{...}` token leaked into the applied DDL.
+        assert!(table_exists(&conn, "gateway_event"));
+
+        // `{pk_autoinc}` rendered to an auto-incrementing integer key: inserting
+        // a row without an id assigns one, which only holds for INTEGER PRIMARY
+        // KEY AUTOINCREMENT.
+        conn.execute("INSERT INTO gateway_event (payload) VALUES ('{}')", [])
+            .unwrap();
+        let id: i64 = conn
+            .query_row("SELECT id FROM gateway_event", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(id, 1);
+
+        // Re-running is idempotent: the recorded checksum is over the template,
+        // so the same template verifies and nothing re-applies.
+        assert!(runner.run_bundle(&conn, &bundle).unwrap().is_empty());
     }
 
     #[test]
