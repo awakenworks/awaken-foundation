@@ -16,17 +16,28 @@ publish = false
 awaken-api-contract = { path = "crates/awaken-api-contract", version = "0.1.0-dev" }
 awaken-connection = { path = "crates/awaken-connection", version = "0.1.0-dev" }
 awaken-connection-auth = { path = "crates/awaken-connection-auth", version = "0.1.0-dev" }
+awaken-connection-transports = { path = "crates/awaken-connection-transports", version = "0.1.0-dev" }
 awaken-scoped-migration = { path = "crates/awaken-scoped-migration", version = "0.1.0-dev" }
 
 # Shared third-party dependencies. Members opt in via `<dep>.workspace = true`.
+async-nats = "0.47"
 async-trait = "0.1"
+bytes = "1"
 futures = "0.3"
-thiserror = "2"
+opentelemetry = "0.28"
+opentelemetry_sdk = "0.28"
+reqwest = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = "0.8"
 sqlx = { version = "0.8", default-features = false }
+testcontainers = "0.23"
+thiserror = "2"
 tokio = "1"
+tracing = "0.1"
+tracing-opentelemetry = { version = "0.29", default-features = false }
+tracing-subscriber = "0.3"
+url = "2.5"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

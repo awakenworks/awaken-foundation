@@ -1,0 +1,46 @@
+[package]
+name = "awaken-connection-transports"
+version.workspace = true
+readme = "../../README.md"
+edition.workspace = true
+rust-version = "1.93"
+description = "Reusable transport adapters for connection channels"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+categories = ["artificial-intelligence", "network-programming"]
+
+[dependencies]
+awaken-connection = { workspace = true }
+awaken-connection-auth = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
+async-nats = { workspace = true, optional = true }
+opentelemetry = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true, default-features = false }
+
+[dev-dependencies]
+opentelemetry_sdk = { workspace = true, features = ["trace"] }
+testcontainers = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "time"] }
+tracing-subscriber = { workspace = true, features = ["registry"] }
+
+[features]
+default = []
+nats = [
+    "dep:async-nats",
+    "dep:opentelemetry",
+    "dep:tracing",
+    "dep:tracing-opentelemetry",
+]
+
+[lints]
+workspace = true

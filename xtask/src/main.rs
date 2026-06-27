@@ -14,6 +14,7 @@ const FOUNDATION_CRATES: &[&str] = &[
     "awaken-api-contract",
     "awaken-connection",
     "awaken-connection-auth",
+    "awaken-connection-transports",
     "awaken-scoped-migration",
     "xtask",
 ];

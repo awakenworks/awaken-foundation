@@ -22,6 +22,8 @@ crates/
   awaken-api-contract       neutral API wire contracts and credential-reference DTOs
   awaken-connection         typed connection core and transport pairing traits
   awaken-connection-auth    opaque, caller-owned handshake material container
+  awaken-connection-transports
+                            reusable HTTP/NATS transport adapters
   awaken-scoped-migration   namespace-scoped, independent SQL migration ledger (postgres/sqlite)
 xtask/                      foundation guardrail (no upward dependency)
 ```
