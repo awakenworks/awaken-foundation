@@ -10,7 +10,13 @@ use std::path::Path;
 use std::process::ExitCode;
 
 /// Crates that legitimately live in this workspace; deps on these are fine.
-const FOUNDATION_CRATES: &[&str] = &["awaken-scoped-migration", "xtask"];
+const FOUNDATION_CRATES: &[&str] = &[
+    "awaken-api-contract",
+    "awaken-connection",
+    "awaken-connection-auth",
+    "awaken-scoped-migration",
+    "xtask",
+];
 
 fn main() -> ExitCode {
     match std::env::args().nth(1).unwrap_or_default().as_str() {

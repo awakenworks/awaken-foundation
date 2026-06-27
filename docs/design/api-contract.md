@@ -200,10 +200,13 @@ secret resolver at the egress boundary. The foundation contract only describes:
 - which scopes or key names are expected,
 - which credential handle should be resolved.
 
-OAuth refresh, token exchange, API-key injection, redaction, rotation,
-authorization to use a credential, and audit logging remain product/runtime
-responsibilities. This keeps the model reusable without putting secrets or
-identity policy in foundation.
+OAuth refresh, token exchange, API-key injection, rotation, authorization to use
+a credential, and audit logging remain product/runtime responsibilities. A
+separate foundation transport crate may carry already-materialized opaque
+handshake material only under ADR-0001's redaction/no-lookup/no-persistence
+constraints; this API contract crate still serializes credential references, not
+secret values. This keeps the model reusable without putting identity policy in
+foundation.
 
 ## TypeScript contract generation
 

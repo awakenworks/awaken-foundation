@@ -16,7 +16,11 @@ crate.
 - **Earn your place.** Promote a crate here only when ≥2 components across product
   lines actually depend on it (rule of three). Premature sharing is worse than
   duplication.
-- **No domain, no secrets.** Foundation carries generic mechanism only.
+- **No domain, no secret lifecycle.** Foundation carries generic mechanism only.
+  Opaque, already-materialized, ephemeral handshake-material carriers are allowed
+  only when they do not acquire, select, authorize, refresh, persist, serialize,
+  log, or domain-classify credentials, and redaction/injection guards are built
+  in.
 - **Stay permissive.** MIT OR Apache-2.0; `cargo deny` keeps the graph copyleft-free.
 - **ADR discipline.** Architectural decisions get an ADR ([template](docs/adr/0000-template.md)).
 

@@ -10,11 +10,18 @@ and that depend on no product themselves.
 
 A crate belongs in the foundation only when it is **proven-shared** — depended on
 by at least two components across product lines — **stable**, **carries no product
-domain or secrets**, and **depends on nothing above it**. See
+domain or secret lifecycle**, and **depends on nothing above it**. See
 [ADR-0001](docs/adr/0001-foundation-tier.md).
+
+Foundation may include opaque, already-materialized handshake-material carriers
+only as audited transport mechanism: no credential lookup, authorization,
+refresh, persistence, serialization, logging, or domain classification.
 
 ```
 crates/
+  awaken-api-contract       neutral API wire contracts and credential-reference DTOs
+  awaken-connection         typed connection core and transport pairing traits
+  awaken-connection-auth    opaque, caller-owned handshake material container
   awaken-scoped-migration   namespace-scoped, independent SQL migration ledger (postgres/sqlite)
 xtask/                      foundation guardrail (no upward dependency)
 ```

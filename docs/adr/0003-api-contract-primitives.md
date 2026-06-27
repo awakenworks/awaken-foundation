@@ -75,9 +75,11 @@ field-level validation, and audit trails.
   are already repeated across products and clients.
 - **Move a full query executor to foundation:** rejected because database paths,
   authorization scope, RLS, and projection semantics are product-specific.
-- **Store OAuth/API tokens in foundation DTOs:** rejected because foundation must
-  carry no secrets. It may model auth requirements and credential handles, but
-  secret values and permission checks stay in the consumer.
+- **Store OAuth/API tokens in foundation DTOs:** rejected because foundation API
+  contracts must not serialize credential material. Foundation may model auth
+  requirements, credential handles, and narrowly-scoped opaque handshake-material
+  carriers under ADR-0001's amendment, but secret acquisition, refresh,
+  persistence, authority, and permission checks stay in the consumer.
 - **Force every list response to `{ items, cursor }`:** rejected because existing
   generated clients benefit from named fields such as `issues` or `runs`. The
   foundation crate makes `{ items, cursor }` the default for new APIs but does

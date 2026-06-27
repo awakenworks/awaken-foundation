@@ -14,14 +14,19 @@ publish = false
 [workspace.dependencies]
 # Foundation crates (path-resolved within this workspace).
 awaken-api-contract = { path = "crates/awaken-api-contract", version = "0.1.0-dev" }
+awaken-connection = { path = "crates/awaken-connection", version = "0.1.0-dev" }
+awaken-connection-auth = { path = "crates/awaken-connection-auth", version = "0.1.0-dev" }
 awaken-scoped-migration = { path = "crates/awaken-scoped-migration", version = "0.1.0-dev" }
 
 # Shared third-party dependencies. Members opt in via `<dep>.workspace = true`.
+async-trait = "0.1"
+futures = "0.3"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = "0.8"
 sqlx = { version = "0.8", default-features = false }
+tokio = "1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

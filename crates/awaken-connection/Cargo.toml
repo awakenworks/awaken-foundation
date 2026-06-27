@@ -1,0 +1,23 @@
+[package]
+name = "awaken-connection"
+version.workspace = true
+readme = "../../README.md"
+edition.workspace = true
+rust-version = "1.93"
+description = "Core typed connection mechanics and transport pairing"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+categories = ["artificial-intelligence"]
+
+[dependencies]
+async-trait = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+
+[lints]
+workspace = true

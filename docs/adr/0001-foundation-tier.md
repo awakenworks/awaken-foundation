@@ -31,6 +31,30 @@ the common layer. A crate belongs here only when **all** hold:
 4. **Permissive.** MIT OR Apache-2.0, with `cargo deny` keeping the graph
    copyleft-free so every consumer can link it.
 
+### Amendment: Opaque handshake-material carriers
+
+The "no secrets" rule forbids foundation crates from owning credential policy or
+raw secret lifecycles, but it does not forbid a narrow reusable mechanism for
+already-materialized handshake material. A foundation crate may carry an opaque,
+ephemeral, caller-owned value used by a transport handshake only when all of the
+following hold:
+
+- it does not acquire, select, authorize, refresh, rotate, persist, serialize, or
+  domain-classify credentials;
+- it does not perform vault, OAuth, environment, account, tenant, or connector
+  lookup;
+- its debug, display, error, tracing, and serialization surfaces cannot expose
+  secret values by default;
+- it validates representation-level injection hazards it introduces, such as
+  HTTP header names/values, without interpreting the credential's authority; and
+- consumers remain responsible for credential ownership, permission checks,
+  expiry, audit logging, and revocation.
+
+This keeps the foundation out of identity and secret management while allowing
+cross-product transport adapters to share a small, audited container for
+short-lived handshake material instead of reimplementing redaction and injection
+guards at every egress boundary.
+
 The first member is `awaken-scoped-migration` (promoted out of the originating product, where
 it was mis-placed and named `awaken-sql-migration`).
 

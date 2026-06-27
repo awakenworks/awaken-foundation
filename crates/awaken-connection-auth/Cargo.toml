@@ -1,0 +1,18 @@
+[package]
+name = "awaken-connection-auth"
+version.workspace = true
+readme = "../../README.md"
+edition.workspace = true
+rust-version = "1.93"
+description = "Opaque caller-owned handshake material for connection transports"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+categories = ["artificial-intelligence"]
+
+[dependencies]
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
