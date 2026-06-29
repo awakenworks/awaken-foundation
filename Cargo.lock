@@ -157,6 +157,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "awaken-query"
+version = "0.1.0-dev"
+dependencies = [
+ "awaken-api-contract",
+ "base64",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "awaken-scoped-migration"
 version = "0.1.0-dev"
 dependencies = [

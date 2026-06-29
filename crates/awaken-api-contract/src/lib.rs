@@ -19,8 +19,8 @@ pub use error::{
     ProblemTypeError, REQUEST_ID_HEADER,
 };
 pub use page::{
-    CursorPage, CursorPageConfig, CursorPageRequest, NumberedPage, OffsetPageRequest,
-    PageNumberRequest, PaginationConfig, PaginationMode, PaginationRequest,
+    CursorPage, CursorPageConfig, CursorPageRequest, GroupBucket, GroupedPage, NumberedPage,
+    OffsetPageRequest, PageNumberRequest, PaginationConfig, PaginationMode, PaginationRequest,
 };
 pub use query::{
     BoolOperator, FilterNode, FilterOperator, FilterScalar, FilterValue, ListQuery, QueryError,

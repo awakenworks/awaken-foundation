@@ -24,6 +24,7 @@ crates/
   awaken-connection-auth    opaque, caller-owned handshake material container
   awaken-connection-transports
                             reusable HTTP/NATS transport adapters
+  awaken-query              dialect-aware filter/sort/cursor to SQL fragment compiler (postgres/sqlite)
   awaken-scoped-migration   namespace-scoped, independent SQL migration ledger (postgres/sqlite)
 xtask/                      foundation guardrail (no upward dependency)
 ```

@@ -192,3 +192,46 @@ impl<T> NumberedPage<T> {
         }
     }
 }
+
+/// One group's slice in a grouped list response.
+///
+/// `total` is the count of items in the whole group (not just this page), and
+/// `cursor` paginates *within* this group when another intra-group page exists.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct GroupBucket<G, T> {
+    pub group: G,
+    pub total: u64,
+    pub items: Vec<T>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+impl<G, T> GroupBucket<G, T> {
+    #[must_use]
+    pub fn new(group: G, total: u64, items: Vec<T>, cursor: Option<String>) -> Self {
+        Self {
+            group,
+            total,
+            items,
+            cursor,
+        }
+    }
+}
+
+/// Grouped list response: a page of groups, each with its own total and
+/// intra-group cursor. The outer `cursor` paginates across groups.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct GroupedPage<G, T> {
+    pub groups: Vec<GroupBucket<G, T>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+impl<G, T> GroupedPage<G, T> {
+    #[must_use]
+    pub fn new(groups: Vec<GroupBucket<G, T>>, cursor: Option<String>) -> Self {
+        Self { groups, cursor }
+    }
+}

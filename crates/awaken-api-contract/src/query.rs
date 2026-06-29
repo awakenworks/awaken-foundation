@@ -163,6 +163,7 @@ impl SortClause {
 pub struct QuerySchema {
     filter_fields: BTreeMap<String, BTreeSet<FilterOperator>>,
     sortable_fields: BTreeSet<String>,
+    groupable_fields: BTreeSet<String>,
     default_sort: Vec<SortClause>,
     page: PaginationConfig,
 }
@@ -196,10 +197,40 @@ impl QuerySchema {
         self
     }
 
+    /// Allow a field to be used as a grouping key. Grouping is a distinct
+    /// capability from filtering and sorting: a column must be explicitly
+    /// opted into grouping before a grouped query may partition on it.
+    #[must_use]
+    pub fn allow_group_field(mut self, field: impl Into<String>) -> Self {
+        self.groupable_fields.insert(field.into());
+        self
+    }
+
     #[must_use]
     pub fn with_default_sort(mut self, sort: Vec<SortClause>) -> Self {
         self.default_sort = sort;
         self
+    }
+
+    /// Whether `field` is allowed as a grouping key.
+    #[must_use]
+    pub fn is_groupable(&self, field: &str) -> bool {
+        self.groupable_fields.contains(field)
+    }
+
+    /// Names of every allowlisted filter field.
+    pub fn filter_field_names(&self) -> impl Iterator<Item = &str> {
+        self.filter_fields.keys().map(String::as_str)
+    }
+
+    /// Names of every allowlisted sort field.
+    pub fn sortable_field_names(&self) -> impl Iterator<Item = &str> {
+        self.sortable_fields.iter().map(String::as_str)
+    }
+
+    /// Names of every allowlisted grouping field.
+    pub fn groupable_field_names(&self) -> impl Iterator<Item = &str> {
+        self.groupable_fields.iter().map(String::as_str)
     }
 
     pub fn validate(&self, query: &ListQuery) -> Result<(), QueryError> {
@@ -212,7 +243,10 @@ impl QuerySchema {
         Ok(())
     }
 
-    fn validate_filter(&self, node: &FilterNode) -> Result<(), QueryError> {
+    /// Validate a filter AST against this allowlist, independent of a full
+    /// [`ListQuery`]. Used by alternative front-ends (e.g. a string DSL parser)
+    /// so every syntax routes through the same field/operator allowlist.
+    pub fn validate_filter(&self, node: &FilterNode) -> Result<(), QueryError> {
         match node {
             FilterNode::Condition {
                 field, operator, ..

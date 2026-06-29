@@ -18,7 +18,20 @@ All notable changes to `awaken-foundation` are recorded here.
   append-only immutability, a destructive-op guard, deterministic statements,
   portable SQL, and unique zero-padded version labels — with reviewable in-diff
   `migration-allow-*` override markers.
+- `awaken-query` — dialect-aware compiler from `awaken-api-contract` list
+  queries to parameterized SQL fragments (filter `WHERE`, `ORDER BY`, opaque
+  keyset cursor conditions, and grouped-pagination windows) for PostgreSQL and
+  SQLite. Re-homes the proven speak2app query DSL onto foundation types: every
+  value bound, every field mapped or rejected, with an optional string-DSL
+  front-end (`dsl` feature) that routes through the same allowlist. Design
+  review and target are in [docs/design/query.md](docs/design/query.md).
+- `GroupedPage`/`GroupBucket` envelopes and `allow_group_field` on `QuerySchema`
+  in `awaken-api-contract`, for grouped list responses with per-group totals and
+  intra-group cursors.
 
 ### Decided
 - Configuration is a shared convention over `figment`, not a foundation crate,
   until duplication earns one (ADR-0002).
+- Shared query engine: `awaken-query` carries the product-free execution half of
+  list queries (validated query → parameterized SQL fragment), distinct from
+  `awaken-api-contract`'s contract half (ADR-0004).
