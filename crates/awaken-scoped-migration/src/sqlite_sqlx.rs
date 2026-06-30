@@ -515,4 +515,113 @@ mod tests {
         pool.close().await;
         cleanup(&path);
     }
+
+    #[tokio::test]
+    async fn per_dialect_migration_applies_the_sqlite_body() {
+        // A `per_dialect` escape-hatch migration round-trips through this shell:
+        // its SQLite body is applied (the Postgres `JSONB` body would error on
+        // SQLite), it is recorded under the SQLite-dialect checksum, and the
+        // re-run skips it. This exercises `sql_for`/`checksum_for` selecting the
+        // SQLite side end-to-end, not the pure core in isolation.
+        let path = temp_path("per-dialect");
+        cleanup(&path);
+        let pool = pool_at(&path);
+        let runner = SqlxSqliteMigrationRunner::with_prefix(pool.clone(), "awaken").unwrap();
+
+        let bundle = MigrationBundle::new(
+            "runtime.core",
+            vec![
+                Migration::new(1, "create t", "CREATE TABLE t (id INTEGER PRIMARY KEY)").unwrap(),
+                Migration::per_dialect(
+                    2,
+                    "json column",
+                    "ALTER TABLE t ADD COLUMN payload JSONB",
+                    "ALTER TABLE t ADD COLUMN payload TEXT",
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let applied = runner.run_bundle(&bundle).await.unwrap();
+        assert_eq!(applied.len(), 2);
+        // The SQLite body ran: the `payload` column exists and accepts a row.
+        sqlx::query("INSERT INTO t (payload) VALUES ('{}')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Recorded under the SQLite-dialect checksum, so the re-run is idempotent
+        // and the escape hatch's per-dialect identity is what landed in the ledger.
+        let recorded: String =
+            sqlx::query("SELECT checksum FROM awaken_schema_migrations WHERE version = 2")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                .get("checksum");
+        assert_eq!(
+            recorded,
+            bundle.migrations()[1].checksum_for(Dialect::Sqlite)
+        );
+        assert!(runner.run_bundle(&bundle).await.unwrap().is_empty());
+
+        pool.close().await;
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn records_configured_applied_by() {
+        // The `applied_by` set on the runner is the value written to the ledger's
+        // `applied_by` column, not the default crate name.
+        let path = temp_path("applied-by");
+        cleanup(&path);
+        let pool = pool_at(&path);
+        let runner = SqlxSqliteMigrationRunner::with_prefix(pool.clone(), "awaken")
+            .unwrap()
+            .with_applied_by("runtime@v1.2.3");
+        runner.run_bundle(&bundle()).await.unwrap();
+
+        let applied_by: String =
+            sqlx::query("SELECT applied_by FROM awaken_schema_migrations WHERE version = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                .get("applied_by");
+        assert_eq!(applied_by, "runtime@v1.2.3");
+
+        pool.close().await;
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn run_bundles_applies_independent_bundles_in_registration_order() {
+        // `run_bundles` applies several independent bundles in the order given,
+        // recording each under its own `bundle_id`. The duplicate-id path is
+        // covered separately; this pins the success path.
+        let path = temp_path("multi-bundle");
+        cleanup(&path);
+        let pool = pool_at(&path);
+        let runner = SqlxSqliteMigrationRunner::with_prefix(pool.clone(), "awaken").unwrap();
+
+        let core = MigrationBundle::new(
+            "runtime.core",
+            vec![Migration::new(1, "core", "CREATE TABLE core_t (id TEXT)").unwrap()],
+        )
+        .unwrap();
+        let audit = MigrationBundle::new(
+            "gateway.audit",
+            vec![Migration::new(1, "audit", "CREATE TABLE audit_t (id TEXT)").unwrap()],
+        )
+        .unwrap();
+
+        let applied = runner.run_bundles(&[core, audit]).await.unwrap();
+        // Both bundles applied, in registration order (core before audit).
+        let ids: Vec<&str> = applied.iter().map(|a| a.bundle_id.as_str()).collect();
+        assert_eq!(ids, ["runtime.core", "gateway.audit"]);
+        assert!(table_exists(&pool, "core_t").await);
+        assert!(table_exists(&pool, "audit_t").await);
+
+        pool.close().await;
+        cleanup(&path);
+    }
 }
