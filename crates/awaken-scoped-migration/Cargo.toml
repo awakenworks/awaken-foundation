@@ -13,13 +13,20 @@ categories = ["database"]
 [dependencies]
 sha2 = "0.10"
 thiserror.workspace = true
-sqlx = { workspace = true, features = ["runtime-tokio", "postgres"], optional = true }
+sqlx = { workspace = true, features = ["runtime-tokio"], optional = true }
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 
 [features]
 default = []
-postgres = ["dep:sqlx"]
+# sqlx-driven backends share one async shell idiom; each pulls in its own sqlx
+# driver feature. `sqlite` (below) is the independent synchronous rusqlite shell.
+postgres = ["dep:sqlx", "sqlx/postgres"]
+sqlite-sqlx = ["dep:sqlx", "sqlx/sqlite"]
 sqlite = ["dep:rusqlite"]
+
+[dev-dependencies]
+# The sqlx-sqlite shell's tests drive an async runner, so they need a runtime.
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 
 [lints]
 workspace = true

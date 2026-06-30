@@ -18,9 +18,17 @@ convergence below resolves it by **taking the better idea from each**.
 - A **pure core**: `Migration` / `MigrationBundle` value types, validation,
   SHA-256 checksums, the `plan()` decision (unknown applied version, checksum
   drift, already-applied skip), and a `MigrationError` taxonomy.
-- A **thin backend shell** per driver (`postgres` over sqlx, `sqlite` over
-  rusqlite) that fetches applied versions, calls `plan()`, and applies the result
-  with its own ledger DDL and transaction.
+- A **thin backend shell** per driver that fetches applied versions, calls
+  `plan()`, and applies the result with its own ledger DDL and transaction:
+  `postgres` (over sqlx, async), `sqlite` (over rusqlite, synchronous — for
+  callers holding a borrowed `&Connection` inside `spawn_blocking`), and
+  `sqlite-sqlx` (over sqlx, async — the SQLite counterpart of `postgres` for
+  services already on a `sqlx::SqlitePool`). The two SQLite shells checksum and
+  plan identically under `Dialect::Sqlite`, so a bundle migrates the same through
+  either; a service picks the shell matching the driver it already runs on. The
+  sqlx SQLite shell takes the single-applier guard (P6) with
+  `pool.begin_with("BEGIN IMMEDIATE")`, the same write-lock-first semantics as the
+  rusqlite shell's `BEGIN IMMEDIATE`.
 - A **per-prefix ledger** table (`{prefix}_schema_migrations`) recording
   `(bundle_id, version, checksum, description, applied_at, applied_by)`.
 

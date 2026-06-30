@@ -23,6 +23,9 @@ pub mod postgres;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
+#[cfg(feature = "sqlite-sqlx")]
+pub mod sqlite_sqlx;
+
 /// Schema version of the ledger itself (its own bookkeeping tables), distinct
 /// from the per-bundle migration versions it records.
 ///
