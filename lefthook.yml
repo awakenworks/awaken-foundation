@@ -34,6 +34,13 @@ pre-commit:
 pre-push:
   parallel: false
   commands:
+    msrv:
+      # Guard the declared MSRV (rust-version in Cargo.toml). The floor is set by
+      # the `time` dependency, which needs let-chains (stable since 1.88); bumping
+      # a dependency can raise the real floor silently. Pinned to +1.88.0 on
+      # purpose so this stays honest even if rust-toolchain.toml moves to a newer
+      # dev toolchain. Requires the 1.88.0 toolchain: `rustup toolchain install 1.88.0`.
+      run: cargo +1.88.0 check --workspace --all-targets --all-features
     clippy:
       run: cargo clippy --workspace --all-targets -- -D clippy::correctness
     guardrails:
