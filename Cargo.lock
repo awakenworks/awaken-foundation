@@ -171,11 +171,18 @@ dependencies = [
 name = "awaken-scoped-migration"
 version = "0.1.0-dev"
 dependencies = [
- "rusqlite",
  "sha2",
  "sqlx",
  "thiserror 2.0.18",
  "tokio",
+]
+
+[[package]]
+name = "awaken-scoped-migration-sqlite"
+version = "0.1.0-dev"
+dependencies = [
+ "awaken-scoped-migration",
+ "rusqlite",
 ]
 
 [[package]]

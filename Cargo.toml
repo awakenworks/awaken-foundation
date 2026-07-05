@@ -19,6 +19,7 @@ awaken-connection-auth = { path = "crates/awaken-connection-auth", version = "0.
 awaken-connection-transports = { path = "crates/awaken-connection-transports", version = "0.1.0-dev" }
 awaken-query = { path = "crates/awaken-query", version = "0.1.0-dev" }
 awaken-scoped-migration = { path = "crates/awaken-scoped-migration", version = "0.1.0-dev" }
+awaken-scoped-migration-sqlite = { path = "crates/awaken-scoped-migration-sqlite", version = "0.1.0-dev" }
 
 # Shared third-party dependencies. Members opt in via `<dep>.workspace = true`.
 async-nats = "0.47"

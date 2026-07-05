@@ -28,6 +28,18 @@ All notable changes to `awaken-foundation` are recorded here.
 - `GroupedPage`/`GroupBucket` envelopes and `allow_group_field` on `QuerySchema`
   in `awaken-api-contract`, for grouped list responses with per-group totals and
   intra-group cursors.
+- `awaken-scoped-migration-sqlite` — the synchronous `rusqlite` SQLite backend,
+  split out of `awaken-scoped-migration` into its own crate and depending on
+  `rusqlite` by range (not a hard pin) so a consumer can float it onto a newer
+  driver (ADR-0005).
+
+### Changed
+- Moved the `rusqlite` SQLite backend out of `awaken-scoped-migration` (its
+  `sqlite` feature and `rusqlite` dependency are gone) into the new
+  `awaken-scoped-migration-sqlite` crate. `rusqlite` and `sqlx` link incompatible
+  versions of the native `libsqlite3-sys`, so a hard pin here deadlocked any graph
+  needing a newer `rusqlite`; the split plus a range requirement removes the
+  deadlock while keeping foundation's 1.88 MSRV (ADR-0005).
 
 ### Decided
 - Configuration is a shared convention over `figment`, not a foundation crate,

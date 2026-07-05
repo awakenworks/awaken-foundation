@@ -1,0 +1,28 @@
+[package]
+name = "awaken-scoped-migration-sqlite"
+description = "Synchronous rusqlite backend for the scoped-migration ledger, decoupled from any pinned driver version"
+version.workspace = true
+edition.workspace = true
+# Floor for the default resolution (rusqlite 0.32 → libsqlite3-sys 0.30, which
+# builds on 1.88). The `rusqlite` requirement below is a *range*, so a consuming
+# graph that already pins a newer rusqlite floats this crate up to it — and that
+# newer driver may need a newer rustc. See ADR-0005.
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+categories = ["database"]
+
+[dependencies]
+awaken-scoped-migration.workspace = true
+# A *range*, deliberately not a hard `^0.x` pin. `rusqlite` pulls the native,
+# `links = "sqlite3"` crate `libsqlite3-sys`, of which a dependency graph may
+# contain exactly one version. Pinning a single 0.x here is what deadlocks any
+# graph that also needs a different rusqlite (e.g. a consumer on rusqlite 0.40
+# while this pinned ^0.32). The range lets the resolver unify this backend onto
+# whatever rusqlite the rest of the graph already selected. See ADR-0005.
+rusqlite = { version = ">=0.32, <0.41", features = ["bundled"] }
+
+[lints]
+workspace = true

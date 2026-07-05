@@ -1,4 +1,5 @@
-//! SQLite backend shell over the pure migration core.
+//! Synchronous SQLite backend shell over the pure [`awaken_scoped_migration`]
+//! core.
 //!
 //! It owns only what is SQLite-specific: the synchronous `rusqlite` driver, the
 //! ledger DDL, and a per-bundle transaction. SQLite is single-writer, so its
@@ -7,13 +8,19 @@
 //! backend-neutral counterpart of the Postgres advisory lock. Migration bodies
 //! run through `execute_batch`, the simple-query path, so a body may contain
 //! multiple statements — mirroring the Postgres shell's `raw_sql`. The apply
-//! decision is delegated to [`crate::plan`].
+//! decision is delegated to [`awaken_scoped_migration::plan`].
+//!
+//! This backend lives in its own crate, separate from the sqlx-driven backends
+//! in `awaken-scoped-migration`, because `rusqlite` and `sqlx` each pull the
+//! native `links = "sqlite3"` crate `libsqlite3-sys` at versions that cannot
+//! coexist in one dependency graph. Keeping this driver in a sibling crate lets
+//! a consumer select exactly one native SQLite backend. See ADR-0005.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 
-use crate::{
+use awaken_scoped_migration::{
     AppliedMigration, Dialect, LEDGER_VERSION, MigrationBundle, MigrationError,
     check_ledger_version, plan, render, sql_identifier,
 };
@@ -243,7 +250,7 @@ fn sqlite_error(operation: &'static str) -> impl Fn(rusqlite::Error) -> Migratio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Migration;
+    use awaken_scoped_migration::Migration;
 
     fn bundle() -> MigrationBundle {
         MigrationBundle::new(

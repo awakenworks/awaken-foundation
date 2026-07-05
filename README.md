@@ -25,7 +25,9 @@ crates/
   awaken-connection-transports
                             reusable HTTP/NATS transport adapters
   awaken-query              dialect-aware filter/sort/cursor to SQL fragment compiler (postgres/sqlite)
-  awaken-scoped-migration   namespace-scoped, independent SQL migration ledger (postgres/sqlite)
+  awaken-scoped-migration   namespace-scoped, independent SQL migration ledger (postgres/sqlx-sqlite)
+  awaken-scoped-migration-sqlite
+                            synchronous rusqlite backend for the ledger, driver-version-agnostic
 xtask/                      foundation guardrail (no upward dependency)
 ```
 

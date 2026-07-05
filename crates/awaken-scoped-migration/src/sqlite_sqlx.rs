@@ -6,11 +6,13 @@
 //! It owns only what is SQLite-specific: the `sqlx` SQLite driver, the SQLite
 //! ledger DDL, and the single-applier guard.
 //!
-//! The crate also ships [`sqlite`](crate::sqlite), an *independent* synchronous
-//! `rusqlite` shell over the same core for callers that hold a borrowed
-//! `&Connection` inside a `spawn_blocking` closure. Both checksum and plan under
-//! [`Dialect::Sqlite`], so a bundle migrates identically through either; pick the
-//! one that matches the driver the service already runs on.
+//! The sibling crate `awaken-scoped-migration-sqlite` ships an *independent*
+//! synchronous `rusqlite` shell over the same core for callers that hold a
+//! borrowed `&Connection` inside a `spawn_blocking` closure. Both checksum and
+//! plan under [`Dialect::Sqlite`], so a bundle migrates identically through
+//! either; pick the one that matches the driver the service already runs on. The
+//! two cannot share a dependency graph (native `libsqlite3-sys` conflict); see
+//! ADR-0005.
 //!
 //! SQLite is single-writer, so the single-applier guard (P6) is the run
 //! transaction itself, opened with `BEGIN IMMEDIATE` to take the write lock
