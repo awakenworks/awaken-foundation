@@ -1,6 +1,6 @@
 [package]
 name = "awaken-scoped-migration"
-description = "Backend-agnostic SQL schema migration ledger (bundles, checksums, fail-closed) with Postgres and sqlx-SQLite runners"
+description = "Backend-agnostic SQL schema migration ledger (bundles, checksums, fail-closed) with a PostgreSQL runner"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -17,15 +17,9 @@ sqlx = { workspace = true, features = ["runtime-tokio"], optional = true }
 
 [features]
 default = []
-# sqlx-driven backends share one async shell idiom; each pulls in its own sqlx
-# driver feature. The independent synchronous rusqlite backend lives in the
-# sibling crate `awaken-scoped-migration-sqlite` (native libsqlite3-sys conflict;
-# see ADR-0005).
 postgres = ["dep:sqlx", "sqlx/postgres"]
-sqlite-sqlx = ["dep:sqlx", "sqlx/sqlite"]
 
 [dev-dependencies]
-# The sqlx-sqlite shell's tests drive an async runner, so they need a runtime.
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 
 [lints]

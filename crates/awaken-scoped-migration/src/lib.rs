@@ -13,10 +13,11 @@
 //! Migration SQL is dialect-bound and therefore lives with each backend's
 //! bundles, never here; only the *mechanism* is shared.
 //!
-//! Backend shells for `sqlx` drivers (`postgres`, `sqlite-sqlx`) live in this
-//! crate. The synchronous `rusqlite` SQLite backend lives in the sibling crate
-//! `awaken-scoped-migration-sqlite`, kept separate because `rusqlite` and `sqlx`
-//! pull incompatible versions of the native `libsqlite3-sys`. See ADR-0005.
+//! The `sqlx` PostgreSQL shell lives in this crate. The canonical SQLite shell
+//! lives in the sibling crate `awaken-scoped-migration-sqlite`; keeping one
+//! SQLite implementation avoids a parallel migration path and prevents
+//! incompatible `libsqlite3-sys` versions entering consumer graphs. See
+//! ADR-0005.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -24,9 +25,6 @@ use sha2::{Digest, Sha256};
 
 #[cfg(feature = "postgres")]
 pub mod postgres;
-
-#[cfg(feature = "sqlite-sqlx")]
-pub mod sqlite_sqlx;
 
 /// Schema version of the ledger itself (its own bookkeeping tables), distinct
 /// from the per-bundle migration versions it records.

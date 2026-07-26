@@ -8,7 +8,8 @@
 
 `awaken-scoped-migration` shipped three backend shells behind features:
 `postgres` and `sqlite-sqlx` (both `sqlx`-driven) and `sqlite` (the synchronous
-`rusqlite` driver). All three lived in one crate.
+`rusqlite` driver). All three lived in one crate, although no repository in the
+Awaken product graph consumed `sqlite-sqlx`.
 
 `rusqlite` and `sqlx` both link the native, `links = "sqlite3"` crate
 `libsqlite3-sys`, of which a dependency graph may contain **exactly one**
@@ -43,8 +44,10 @@ We will house the synchronous `rusqlite` SQLite backend in its own crate,
 `awaken-scoped-migration-sqlite`, depending on the pure core crate
 `awaken-scoped-migration` (whose public backend-authoring surface — `plan`,
 `render`, `check_ledger_version`, the value types, and `MigrationError` — is
-already exported). The `sqlx`-driven backends (`postgres`, `sqlite-sqlx`) stay
-in `awaken-scoped-migration`.
+already exported). It is the single SQLite runner. The unused `sqlite-sqlx`
+shell is removed rather than retained as a second implementation of the same
+ledger semantics. The `sqlx` PostgreSQL runner stays in
+`awaken-scoped-migration`.
 
 The new crate requires `rusqlite` with a **range, not a hard `^0.x` pin**:
 `rusqlite = ">=0.32, <0.41"`. Pinning a single 0.x of a `links` native library
@@ -65,12 +68,10 @@ lower end (0.32, which builds on 1.88); a consumer that floats it to a newer
   unified with sqlx's `libsqlite3-sys` 0.30), so the `+1.88.0` MSRV gate stays
   green. A `cargo update` that floats `rusqlite` to 0.40 would turn that gate red
   — the intended signal that the effective MSRV rose.
-- The `rusqlite` and `sqlx-sqlite` backends can no longer be built in one graph.
-  That combination was never useful (two SQLite drivers in one binary), so the
-  loss is nominal; a consumer picks exactly one native SQLite backend.
-- This remains blocked only for a graph that genuinely needs *both* sqlx-sqlite
-  and rusqlite 0.40 at once — unsolvable by anyone until sqlx moves to
-  `libsqlite3-sys` 0.38. When it does, the range absorbs it with no code change.
+- Consumers use one SQLite migration mechanism, independent of whether their
+  application data path uses another database library. No current consumer has
+  to select between two runners or reconcile two native SQLite dependency
+  graphs.
 
 ## Alternatives considered
 
@@ -84,5 +85,10 @@ lower end (0.32, which builds on 1.88); a consumer that floats it to a newer
   same reason as the bump: with sqlx present the resolver holds `rusqlite` at
   0.32 to satisfy `links`, so the range can never float to 0.40 there. The range
   only works once `rusqlite` is alone in its crate — hence the split.
+- **Retain the unused `sqlite-sqlx` runner.** Rejected: it had no consumer,
+  duplicated the SQLite ledger shell, and its dependency graph introduced a
+  yanked transitive crate. A future async SQLite runner must first demonstrate
+  a real consumer and replace the canonical shell rather than create a second
+  path.
 - **Leave it to the consumer** (bespoke store, no shared ledger). Rejected: it
   duplicates the fail-closed ledger mechanism this tier exists to share.
