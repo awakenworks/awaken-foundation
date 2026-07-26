@@ -140,6 +140,33 @@ impl PostgresMigrationRunner {
         Ok(applied)
     }
 
+    /// Verify that an operator already applied every migration in `bundle`.
+    ///
+    /// This path is deliberately read-only: it neither creates the ledger nor
+    /// records or executes a migration. Application processes use it after a
+    /// deployment migration Job; missing schema, drift, unknown versions and a
+    /// pending migration all fail closed.
+    pub async fn verify_bundle(&self, bundle: &MigrationBundle) -> Result<(), MigrationError> {
+        self.assert_ledger_version().await?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(pg_error("postgres_migration_verify_begin"))?;
+        let applied_versions = self.applied_versions(&mut tx, bundle.bundle_id()).await?;
+        let pending = plan(bundle, &applied_versions, DIALECT)?;
+        if let Some(migration) = pending.first() {
+            return Err(MigrationError::PendingMigration {
+                bundle_id: bundle.bundle_id().to_string(),
+                version: migration.version(),
+            });
+        }
+        tx.rollback()
+            .await
+            .map_err(pg_error("postgres_migration_verify_rollback"))?;
+        Ok(())
+    }
+
     /// Run bundles in registration order, rejecting duplicate bundle ids.
     pub async fn run_bundles(
         &self,
@@ -158,6 +185,20 @@ impl PostgresMigrationRunner {
             applied.extend(self.run_bundle(bundle).await?);
         }
         Ok(applied)
+    }
+
+    /// Verify several independent bundles without applying any DDL.
+    pub async fn verify_bundles(&self, bundles: &[MigrationBundle]) -> Result<(), MigrationError> {
+        let mut seen = std::collections::BTreeSet::new();
+        for bundle in bundles {
+            if !seen.insert(bundle.bundle_id()) {
+                return Err(MigrationError::DuplicateBundle(
+                    bundle.bundle_id().to_string(),
+                ));
+            }
+            self.verify_bundle(bundle).await?;
+        }
+        Ok(())
     }
 
     async fn ensure_ledger(&self) -> Result<(), MigrationError> {
@@ -251,5 +292,85 @@ fn pg_error(operation: &'static str) -> impl Fn(sqlx::Error) -> MigrationError {
     move |error| MigrationError::Backend {
         operation,
         message: error.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Migration;
+
+    fn bundle(version_two: bool) -> MigrationBundle {
+        let mut migrations = vec![
+            Migration::new(
+                1,
+                "initial table",
+                "CREATE TABLE {prefix}_item (id TEXT PRIMARY KEY)",
+            )
+            .unwrap(),
+        ];
+        if version_two {
+            migrations.push(
+                Migration::new(
+                    2,
+                    "item description",
+                    "ALTER TABLE {prefix}_item ADD COLUMN description TEXT",
+                )
+                .unwrap(),
+            );
+        }
+        MigrationBundle::new("foundation.verify_test", migrations).unwrap()
+    }
+
+    /// Cause/effect decision table: an application verifier cannot bootstrap a
+    /// missing ledger, accepts a fully migrated bundle, and rejects a newly
+    /// pending version without changing the database.
+    #[tokio::test]
+    async fn postgres_application_verification_is_read_only_and_fail_closed() {
+        let Some(url) = std::env::var("AWAKEN_TEST_POSTGRES_URL").ok() else {
+            return;
+        };
+        let pool = PgPool::connect(&url).await.unwrap();
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let prefix = format!("verify_{suffix}");
+        let runner = PostgresMigrationRunner::with_prefix(pool.clone(), &prefix).unwrap();
+
+        assert!(runner.verify_bundle(&bundle(false)).await.is_err());
+        let ledger: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
+            .bind(runner.ledger_table())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(ledger.is_none(), "verification must not create its ledger");
+
+        runner.run_bundle(&bundle(false)).await.unwrap();
+        runner.verify_bundle(&bundle(false)).await.unwrap();
+        assert!(matches!(
+            runner.verify_bundle(&bundle(true)).await,
+            Err(MigrationError::PendingMigration { version: 2, .. })
+        ));
+        let description_column: Option<String> = sqlx::query_scalar::<_, String>(
+            "SELECT column_name FROM information_schema.columns \
+             WHERE table_name = $1 AND column_name = 'description'",
+        )
+        .bind(format!("{prefix}_item"))
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert!(
+            description_column.is_none(),
+            "verification must not apply DDL"
+        );
+
+        sqlx::raw_sql(&format!(
+            "DROP TABLE {prefix}_item; DROP TABLE {prefix}_schema_migrations; \
+             DROP TABLE {prefix}_schema_migrations_meta"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
     }
 }

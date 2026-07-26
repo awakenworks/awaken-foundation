@@ -31,6 +31,22 @@ convergence below resolves it by **taking the better idea from each**.
   rusqlite shell's `BEGIN IMMEDIATE`.
 - A **per-prefix ledger** table (`{prefix}_schema_migrations`) recording
   `(bundle_id, version, checksum, description, applied_at, applied_by)`.
+- PostgreSQL exposes two deliberately different operational paths:
+  `run_bundle` is the schema-changing migration command path, while
+  `verify_bundle` is a read-only application-startup check. Verification never
+  creates a missing ledger and fails on missing schema, checksum drift, unknown
+  versions, or the first pending migration.
+
+The deployment decision table is:
+
+| Caller | Ledger | Applied plan | Result |
+|---|---|---|---|
+| migration Job | absent/current | pending | apply under the single-applier guard |
+| migration Job | current | complete | idempotent no-op |
+| application | absent | any | fail without DDL |
+| application | current | pending | fail with `PendingMigration` |
+| application | current | complete | connect |
+| either | drift/unknown version | any | fail closed |
 
 The two-layer split (pure decision core + dialect shell) is good and is kept. The
 problems are below.

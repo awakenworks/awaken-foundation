@@ -668,6 +668,8 @@ pub enum MigrationError {
         expected: String,
         actual: String,
     },
+    #[error("bundle '{bundle_id}' migration V{version:04} is pending")]
+    PendingMigration { bundle_id: String, version: i64 },
     #[error(
         "ledger '{ledger_table}' is stamped version {found}, but this runner expects {expected}"
     )]
