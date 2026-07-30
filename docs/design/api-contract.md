@@ -11,11 +11,32 @@ shared below product code:
 - list query model: `filter[field]`, `filter[field][op]`, `sort`
 - filter and sort allowlists per resource/read model
 - credential references for connection auth; never raw secrets
+- optional cross-console suite navigation without product topology
 
 The crate does not define workspace, issue, run, credential, or other product
 objects. It also does not contain authorization, RLS, database translation, or
 an axum adapter. Those belong in the consumer because they depend on route
 scope, storage layout, and product policy.
+
+## Suite navigation
+
+Separately delivered product consoles share one small deployment projection at
+`/.well-known/awaken-suite-navigation`:
+
+```json
+{ "hub_url": "https://cloud.example/products" }
+```
+
+`SuiteNavigation` carries only the exact trusted hub URL, or `null` for a
+standalone product. It does not carry product URLs, tenant or Workspace
+coordinates, identity, entitlements, permissions, or Billing state. Each
+product owns its local shell and routes; the suite hub remains the sole owner of
+product availability and launch targets. Consumers validate the configured URL
+at their deployment boundary and serve this inert projection from the constant
+`SUITE_NAVIGATION_PATH`.
+
+The same DTO is consumed by Awaken and Awaken Flow. This earns its Foundation
+placement under ADR-0001 while preventing two handwritten wire contracts.
 
 ## Query shape
 

@@ -58,6 +58,21 @@ guards at every egress boundary.
 The first member is `awaken-scoped-migration` (promoted out of the originating product, where
 it was mis-placed and named `awaken-sql-migration`).
 
+### Amendment: neutral suite-navigation projection (2026-07-30)
+
+Awaken and Awaken Flow are separately delivered products that may be composed
+by the same deployment. Both require the same optional browser projection to
+return to a deployment-owned suite hub, and neither may learn the other's URL,
+tenant topology, identity policy, or Billing state.
+
+`awaken-api-contract` therefore owns `SuiteNavigation { hub_url }` and the
+`/.well-known/awaken-suite-navigation` path. The DTO is inert mechanism: it has
+no product enum, account or scope identity, entitlement, authorization, route
+selection, persistence, or secret. Products validate their configured URL and
+serve the projection; the composing platform owns the destination. This is one
+shared wire contract for two existing cross-product consumers, not a new
+navigation service or product model.
+
 ## Consequences
 
 - Easier: products and the common service share one base without cross-product coupling; the
