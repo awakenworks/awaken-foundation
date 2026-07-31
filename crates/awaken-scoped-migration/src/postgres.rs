@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 use sqlx::{PgPool, Row};
 
 use crate::{
-    AppliedMigration, Dialect, LEDGER_VERSION, MigrationBundle, MigrationError,
-    check_ledger_version, plan, render, sql_identifier,
+    AppliedMigration, Dialect, LedgerBootstrapAction, LedgerSchema, MigrationBundle,
+    MigrationError, check_ledger_version, plan, render, sql_identifier,
 };
 
 /// The dialect this backend shell applies and checksums migrations under.
@@ -22,20 +22,19 @@ const DIALECT: Dialect = Dialect::Postgres;
 pub struct PostgresMigrationRunner {
     pool: PgPool,
     prefix: String,
-    ledger_table: String,
-    meta_table: String,
+    ledger: LedgerSchema,
     applied_by: String,
 }
 
 impl PostgresMigrationRunner {
     pub fn with_prefix(pool: PgPool, prefix: impl AsRef<str>) -> Result<Self, MigrationError> {
         let prefix = sql_identifier(prefix.as_ref())?;
+        let ledger = LedgerSchema::with_prefix(&prefix)?;
         Ok(Self {
             pool,
-            ledger_table: format!("{prefix}_schema_migrations"),
-            meta_table: format!("{prefix}_schema_migrations_meta"),
             applied_by: "awaken-scoped-migration".to_string(),
             prefix,
+            ledger,
         })
     }
 
@@ -47,7 +46,7 @@ impl PostgresMigrationRunner {
 
     #[must_use]
     pub fn ledger_table(&self) -> &str {
-        &self.ledger_table
+        self.ledger.ledger_table()
     }
 
     /// Acquire the single-applier guard for a run (P6).
@@ -65,7 +64,7 @@ impl PostgresMigrationRunner {
         bundle_id: &str,
     ) -> Result<(), MigrationError> {
         sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))")
-            .bind(&self.ledger_table)
+            .bind(self.ledger.ledger_table())
             .bind(bundle_id)
             .execute(&mut **tx)
             .await
@@ -110,7 +109,7 @@ impl PostgresMigrationRunner {
             let insert_sql = format!(
                 "INSERT INTO {} (bundle_id, version, checksum, description, applied_by)
                  VALUES ($1, $2, $3, $4, $5)",
-                self.ledger_table
+                self.ledger.ledger_table()
             );
             let checksum = migration.checksum_for(DIALECT);
             // The ledger records the readable `V0001`-labelled description so a
@@ -202,62 +201,82 @@ impl PostgresMigrationRunner {
     }
 
     async fn ensure_ledger(&self) -> Result<(), MigrationError> {
-        let sql = format!(
-            "CREATE TABLE IF NOT EXISTS {} (
-                bundle_id TEXT NOT NULL,
-                version BIGINT NOT NULL,
-                checksum TEXT NOT NULL,
-                description TEXT NOT NULL,
-                applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                applied_by TEXT NOT NULL,
-                PRIMARY KEY (bundle_id, version)
-            )",
-            self.ledger_table
-        );
-        sqlx::query(&sql)
-            .execute(&self.pool)
+        let mut tx = self
+            .pool
+            .begin()
             .await
-            .map_err(pg_error("postgres_migration_ledger_schema"))?;
+            .map_err(pg_error("postgres_migration_bootstrap_begin"))?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))")
+            .bind(self.ledger.ledger_table())
+            .bind("ledger-bootstrap-v1")
+            .execute(&mut *tx)
+            .await
+            .map_err(pg_error("postgres_migration_bootstrap_lock"))?;
 
-        // Companion marker table stamping the ledger's own schema version. Kept
-        // as its own statement so it stays within the prepared protocol's
-        // one-statement-per-query limit, like every other runner query.
-        let meta_sql = format!(
-            "CREATE TABLE IF NOT EXISTS {} (ledger_version BIGINT NOT NULL)",
-            self.meta_table
-        );
-        sqlx::query(&meta_sql)
-            .execute(&self.pool)
+        let presence = sqlx::query(
+            "SELECT to_regclass($1) IS NOT NULL AS ledger_exists, \
+                    to_regclass($2) IS NOT NULL AS meta_exists",
+        )
+        .bind(self.ledger.ledger_table())
+        .bind(self.ledger.meta_table())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(pg_error("postgres_migration_bootstrap_probe"))?;
+        let action = self.ledger.bootstrap_action(
+            presence
+                .try_get("ledger_exists")
+                .map_err(pg_error("postgres_migration_bootstrap_decode"))?,
+            presence
+                .try_get("meta_exists")
+                .map_err(pg_error("postgres_migration_bootstrap_decode"))?,
+        )?;
+        if action == LedgerBootstrapAction::Create {
+            for statement in self.ledger.create_statements(DIALECT) {
+                sqlx::raw_sql(&statement)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(pg_error("postgres_migration_bootstrap_create"))?;
+            }
+        }
+        self.assert_ledger_version_in(&mut tx).await?;
+        tx.commit()
             .await
-            .map_err(pg_error("postgres_migration_meta_schema"))?;
-
-        // Seed exactly once: a freshly created (empty) marker is stamped with the
-        // current version; an already-stamped ledger is left untouched.
-        let seed_sql = format!(
-            "INSERT INTO {meta} (ledger_version)
-             SELECT $1 WHERE NOT EXISTS (SELECT 1 FROM {meta})",
-            meta = self.meta_table
-        );
-        sqlx::query(&seed_sql)
-            .bind(LEDGER_VERSION)
-            .execute(&self.pool)
-            .await
-            .map_err(pg_error("postgres_migration_meta_seed"))?;
-        Ok(())
+            .map_err(pg_error("postgres_migration_bootstrap_commit"))
     }
 
     /// Read the stamped ledger version and fail closed unless it matches the
     /// version this runner expects.
     async fn assert_ledger_version(&self) -> Result<(), MigrationError> {
-        let sql = format!("SELECT ledger_version FROM {} LIMIT 1", self.meta_table);
-        let row = sqlx::query(&sql)
-            .fetch_one(&self.pool)
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(pg_error("postgres_migration_meta_begin"))?;
+        self.assert_ledger_version_in(&mut tx).await?;
+        tx.rollback()
+            .await
+            .map_err(pg_error("postgres_migration_meta_rollback"))
+    }
+
+    async fn assert_ledger_version_in(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ) -> Result<(), MigrationError> {
+        let sql = format!("SELECT ledger_version FROM {}", self.ledger.meta_table());
+        let rows = sqlx::query(&sql)
+            .fetch_all(&mut **tx)
             .await
             .map_err(pg_error("postgres_migration_meta_read"))?;
-        let found: i64 = row
+        if rows.len() != 1 {
+            return Err(MigrationError::LedgerMetadataRowCount {
+                meta_table: self.ledger.meta_table().to_string(),
+                found: rows.len(),
+            });
+        }
+        let found: i64 = rows[0]
             .try_get("ledger_version")
             .map_err(pg_error("postgres_migration_meta_decode"))?;
-        check_ledger_version(&self.ledger_table, found)
+        check_ledger_version(self.ledger.ledger_table(), found)
     }
 
     async fn applied_versions(
@@ -267,7 +286,7 @@ impl PostgresMigrationRunner {
     ) -> Result<BTreeMap<i64, String>, MigrationError> {
         let sql = format!(
             "SELECT version, checksum FROM {} WHERE bundle_id = $1 ORDER BY version",
-            self.ledger_table
+            self.ledger.ledger_table()
         );
         let rows = sqlx::query(&sql)
             .bind(bundle_id)

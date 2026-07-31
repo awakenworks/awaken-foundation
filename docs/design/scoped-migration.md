@@ -141,10 +141,11 @@ this so concurrent startup is safe on both backends.
 
 ### P7 — The ledger table has no migration path of its own
 
-`ensure_ledger` is a fixed `CREATE TABLE IF NOT EXISTS`. If the ledger schema ever
-needs a column, there is no path to evolve it — the migrator cannot migrate
-itself. The target versions the ledger (a `ledger_version` marker) so its own
-schema can evolve.
+The ledger cannot ledger its own creation. The runner therefore treats it as a
+generation-stamped bootstrap schema: under a namespace lock it probes the ledger
+and meta tables together, creates both with unconditional statements only when
+both are absent, validates when both are present, and fails closed on partial
+state. A `ledger_version` marker identifies the generation.
 
 ### P8 — Two parallel implementations (the meta-problem)
 
@@ -371,8 +372,8 @@ a check in the next section.
    it branches on live DB state and **masks drift** — `CREATE TABLE IF NOT EXISTS`
    silently passes when the ledger says "not applied" but the table already exists,
    recording a lie; a bare `CREATE TABLE` fails loudly and surfaces the
-   inconsistency. The one legitimate `IF NOT EXISTS` is the ledger's own bootstrap,
-   which is crate-internal (and excluded from the hook's discovery).
+   inconsistency. The ledger bootstrap follows the same rule: it probes under a
+   lock and then executes unconditional creation, so there is no exception.
 4. **Portable SQL by default.** Use the token vocabulary (`{prefix}`, `{json}`,
    `{timestamptz}`, …) so one template serves both backends; raw dialect types only
    via the escape hatch.
@@ -443,11 +444,10 @@ cannot be derived from a diff. See [`hooks/README.md`](../../hooks/README.md).
    via the escape hatch initially).
 4. Retire the common service's `store/migration.rs`; depend on this crate; move the
    `identity.*` bundles over.
-5. **Rewrite existing bundles to deterministic DDL.** Today both the originating product and
-   the common service use `CREATE TABLE IF NOT EXISTS` in their bundles (a habit from
-   before the ledger guaranteed exactly-once). Drop the `IF NOT EXISTS`: the ledger
-   is the single idempotency mechanism, and a bare `CREATE` surfaces drift instead
-   of hiding it. The ledger's own bootstrap DDL keeps `IF NOT EXISTS` — it cannot
-   ledger its own creation.
+5. **Rewrite existing bundles and bootstrap to deterministic DDL.** Drop every
+   conditional clause: the ledger is the single migration idempotency mechanism,
+   and a bare command surfaces drift instead of hiding it. Bootstrap acquires a
+   namespace lock, probes the ledger/meta pair, and runs unconditional DDL only
+   when both are absent; partial state is an error, never an implicit repair.
 6. Add the build-time lints (duplicate version, cross-scope prefix reference) and
    wire `check_migrations.py` into each consumer's hooks.
