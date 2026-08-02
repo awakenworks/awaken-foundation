@@ -25,6 +25,14 @@ historical bodies: `published_legacy` and `published_legacy_per_dialect`. They
 preserve migrations that predate deterministic admission while requiring the
 caller to pin every checksum already recorded by supported backends.
 
+If two released numbering tracks assigned different immutable bodies to the same
+version but their completed bundles converge to the same schema,
+`published_legacy_with_aliases` keeps one canonical body for absent receipts and
+accepts a closed list of alternate historical receipt checksums. An alias never
+selects or executes alternate SQL. The consumer must test each supported released
+ledger prefix and its forward convergence; arbitrary interrupted prefixes are not
+implied by the alias.
+
 Construction and every later bundle validation recompute
 `SHA-256(label || 0x00 || sql)` and reject any mismatch. Only this exact variant
 skips conditional-SQL admission. It continues through the same `MigrationBundle`,
@@ -37,6 +45,10 @@ migrations must use `Migration::new` or `Migration::per_dialect`.
   migration bytes without changing ledger truth.
 - A historical file cannot be silently cleaned up, reordered, or repurposed; its
   pinned checksum makes drift fail during application construction, before I/O.
+- A known parallel numbering track can be retired without editing its ledger or
+  keeping a second runner; exact aliases verify through the same `plan` path.
+- Alias use is safe only when consumer tests prove the named complete release
+  prefixes converge through the canonical pending suffix.
 - Deterministic SQL remains mandatory for all new migration constructors.
 - The compatibility marker is explicit at each exceptional call site and does
   not add a runner, repository, ledger table, or backend-specific path.

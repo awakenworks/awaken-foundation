@@ -236,7 +236,8 @@ pub fn render(template: &str, dialect: Dialect, prefix: &str) -> String {
 /// dialect-independence explicitly. [`PublishedLegacy`](MigrationBody::PublishedLegacy)
 /// preserves an already-recorded body that predates deterministic-SQL admission;
 /// its pinned checksum prevents this compatibility boundary from becoming an
-/// authoring escape hatch.
+/// authoring escape hatch. Its optional closed alias set recognizes receipts
+/// from a second retired numbering track without changing the canonical body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MigrationBody {
     Portable(String),
@@ -247,6 +248,7 @@ enum MigrationBody {
     PublishedLegacy {
         sql: String,
         expected_checksum: String,
+        accepted_checksum_aliases: Vec<String>,
     },
     PublishedLegacyPerDialect {
         postgres: String,
@@ -329,6 +331,42 @@ impl Migration {
             body: MigrationBody::PublishedLegacy {
                 sql: sql.into(),
                 expected_checksum: expected_checksum.into(),
+                accepted_checksum_aliases: Vec::new(),
+            },
+        };
+        migration.validate()?;
+        Ok(migration)
+    }
+
+    /// Preserve one canonical published body while accepting exact checksum
+    /// identities from a second, already-published numbering track.
+    ///
+    /// The canonical `sql` remains pinned by `expected_checksum` and is the only
+    /// body executed for a ledger where this version is absent. Aliases only
+    /// verify an existing receipt; they never select or execute alternate SQL.
+    /// Consumers must therefore prove that every supported released ledger
+    /// prefix converges to the same schema before using this compatibility edge.
+    pub fn published_legacy_with_aliases<I, S>(
+        version: i64,
+        description: impl Into<String>,
+        sql: impl Into<String>,
+        expected_checksum: impl Into<String>,
+        accepted_checksum_aliases: I,
+    ) -> Result<Self, MigrationError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let migration = Self {
+            version,
+            description: description.into(),
+            body: MigrationBody::PublishedLegacy {
+                sql: sql.into(),
+                expected_checksum: expected_checksum.into(),
+                accepted_checksum_aliases: accepted_checksum_aliases
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
             },
         };
         migration.validate()?;
@@ -481,9 +519,20 @@ impl Migration {
         }
         match &self.body {
             MigrationBody::PublishedLegacy {
-                expected_checksum, ..
+                expected_checksum,
+                accepted_checksum_aliases,
+                ..
             } => {
-                self.verify_published_checksum("portable", Dialect::Postgres, expected_checksum)?
+                self.verify_published_checksum("portable", Dialect::Postgres, expected_checksum)?;
+                let mut identities = BTreeSet::from([expected_checksum.as_str()]);
+                for alias in accepted_checksum_aliases {
+                    if !is_sha256_hex(alias) || !identities.insert(alias.as_str()) {
+                        return Err(MigrationError::InvalidMigration {
+                            version: self.version,
+                            reason: "published checksum aliases must be unique lowercase SHA-256 values distinct from the canonical checksum",
+                        });
+                    }
+                }
             }
             MigrationBody::PublishedLegacyPerDialect {
                 postgres_expected_checksum,
@@ -527,6 +576,26 @@ impl Migration {
             actual,
         })
     }
+
+    fn accepts_checksum(&self, dialect: Dialect, recorded: &str) -> bool {
+        if recorded == self.checksum_for(dialect) {
+            return true;
+        }
+        matches!(
+            &self.body,
+            MigrationBody::PublishedLegacy {
+                accepted_checksum_aliases,
+                ..
+            } if accepted_checksum_aliases.iter().any(|alias| alias == recorded)
+        )
+    }
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 /// Reject state-dependent SQL clauses whose success would let the ledger record
@@ -654,7 +723,7 @@ pub fn plan<'a>(
         match applied.get(&migration.version()) {
             Some(existing) => {
                 let recomputed = migration.checksum_for(dialect);
-                if existing != &recomputed {
+                if !migration.accepts_checksum(dialect, existing) {
                     return Err(MigrationError::ChecksumMismatch {
                         bundle_id: bundle.bundle_id().to_string(),
                         version: migration.version(),
@@ -1184,6 +1253,11 @@ mod deterministic_sql_tests {
          *     bundle/runner I/O with PublishedLegacyChecksumMismatch.
          * R4 blank historical SQL => ordinary InvalidMigration still applies.
          * R5 per-dialect historical SQL pins and verifies each backend separately.
+         * R6 exact canonical or declared alias receipt => both skip one logical
+         *     migration; absent receipt still applies only the canonical body.
+         * R7 undeclared receipt => ChecksumMismatch remains fail-closed.
+         * R8 malformed, duplicate, or canonical-equal aliases => construction
+         *     fails, so an alias cannot become an unreviewed wildcard.
          */
         const SQL: &str = "DROP TABLE IF EXISTS t";
         const RECORDED: &str = "23af8cff460d4d273c4642a49382ce9b596296abb7527c9ceaafe3e01f085bab";
@@ -1209,6 +1283,52 @@ mod deterministic_sql_tests {
         );
         let applied = BTreeMap::from([(7, RECORDED.to_string())]);
         assert!(plan(&bundle, &applied, Dialect::Sqlite).unwrap().is_empty());
+
+        const ALIAS: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let aliased = Migration::published_legacy_with_aliases(
+            7,
+            "two published numbering tracks",
+            SQL,
+            RECORDED,
+            [ALIAS],
+        )
+        .expect("canonical bytes and an exact alternate receipt are explicit");
+        let aliased_bundle = MigrationBundle::new("test.alias", vec![aliased]).unwrap();
+        assert_eq!(
+            plan(&aliased_bundle, &BTreeMap::new(), Dialect::Sqlite)
+                .unwrap()
+                .len(),
+            1
+        );
+        for recorded in [RECORDED, ALIAS] {
+            let ledger = BTreeMap::from([(7, recorded.to_string())]);
+            assert!(
+                plan(&aliased_bundle, &ledger, Dialect::Sqlite)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let undeclared = BTreeMap::from([(
+            7,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+        )]);
+        assert!(matches!(
+            plan(&aliased_bundle, &undeclared, Dialect::Sqlite).unwrap_err(),
+            MigrationError::ChecksumMismatch { version: 7, .. }
+        ));
+        for aliases in [vec!["short"], vec![ALIAS, ALIAS], vec![RECORDED]] {
+            assert!(matches!(
+                Migration::published_legacy_with_aliases(
+                    7,
+                    "invalid aliases",
+                    SQL,
+                    RECORDED,
+                    aliases,
+                )
+                .unwrap_err(),
+                MigrationError::InvalidMigration { version: 7, .. }
+            ));
+        }
 
         assert!(matches!(
             Migration::published_legacy(7, "rewritten", "DROP TABLE t", RECORDED).unwrap_err(),

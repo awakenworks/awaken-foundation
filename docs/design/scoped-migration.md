@@ -377,7 +377,12 @@ a check in the next section.
    A migration already recorded before this rule may use
    `Migration::published_legacy` with its exact recorded checksum; this preserves
    immutable history through the same runner and cannot authorize new or edited
-   SQL. See [ADR-0006](../adr/0006-published-legacy-migration-compatibility.md).
+   SQL. When two already-released numbering tracks converge to one schema,
+   `Migration::published_legacy_with_aliases` may additionally accept a closed
+   set of exact historical receipt identities while retaining one canonical body
+   for absent receipts. The consumer must test every supported complete release
+   prefix and its canonical forward suffix. See
+   [ADR-0006](../adr/0006-published-legacy-migration-compatibility.md).
 4. **Portable SQL by default.** Use the token vocabulary (`{prefix}`, `{json}`,
    `{timestamptz}`, …) so one template serves both backends; raw dialect types only
    via the escape hatch.
