@@ -20,10 +20,10 @@ ledger rewrite would create a second path and destroy the drift guarantee.
 
 ## Decision
 
-`Migration` will expose one compatibility constructor,
-`published_legacy(version, description, sql, expected_checksum)`. It preserves a
-portable historical body that predates deterministic admission while requiring
-the caller to pin the checksum already recorded in durable ledgers.
+`Migration` will expose compatibility constructors for portable and per-dialect
+historical bodies: `published_legacy` and `published_legacy_per_dialect`. They
+preserve migrations that predate deterministic admission while requiring the
+caller to pin every checksum already recorded by supported backends.
 
 Construction and every later bundle validation recompute
 `SHA-256(label || 0x00 || sql)` and reject any mismatch. Only this exact variant

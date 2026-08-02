@@ -248,6 +248,12 @@ enum MigrationBody {
         sql: String,
         expected_checksum: String,
     },
+    PublishedLegacyPerDialect {
+        postgres: String,
+        postgres_expected_checksum: String,
+        sqlite: String,
+        sqlite_expected_checksum: String,
+    },
 }
 
 /// One ordered SQL migration inside a named bundle.
@@ -329,6 +335,32 @@ impl Migration {
         Ok(migration)
     }
 
+    /// Preserve an already-published per-dialect migration, pinning the exact
+    /// checksum recorded by each backend. This is the historical counterpart to
+    /// [`Migration::per_dialect`]; it has the same compatibility-only contract as
+    /// [`Migration::published_legacy`] and cannot authorize edited SQL.
+    pub fn published_legacy_per_dialect(
+        version: i64,
+        description: impl Into<String>,
+        postgres: impl Into<String>,
+        postgres_expected_checksum: impl Into<String>,
+        sqlite: impl Into<String>,
+        sqlite_expected_checksum: impl Into<String>,
+    ) -> Result<Self, MigrationError> {
+        let migration = Self {
+            version,
+            description: description.into(),
+            body: MigrationBody::PublishedLegacyPerDialect {
+                postgres: postgres.into(),
+                postgres_expected_checksum: postgres_expected_checksum.into(),
+                sqlite: sqlite.into(),
+                sqlite_expected_checksum: sqlite_expected_checksum.into(),
+            },
+        };
+        migration.validate()?;
+        Ok(migration)
+    }
+
     #[must_use]
     pub const fn version(&self) -> i64 {
         self.version
@@ -375,6 +407,12 @@ impl Migration {
                 Dialect::Sqlite => sqlite,
             },
             MigrationBody::PublishedLegacy { sql, .. } => sql,
+            MigrationBody::PublishedLegacyPerDialect {
+                postgres, sqlite, ..
+            } => match dialect {
+                Dialect::Postgres => postgres,
+                Dialect::Sqlite => sqlite,
+            },
         }
     }
 
@@ -388,6 +426,9 @@ impl Migration {
                 vec![postgres.as_str(), sqlite.as_str()]
             }
             MigrationBody::PublishedLegacy { sql, .. } => vec![sql.as_str()],
+            MigrationBody::PublishedLegacyPerDialect {
+                postgres, sqlite, ..
+            } => vec![postgres.as_str(), sqlite.as_str()],
         }
     }
 
@@ -438,24 +479,53 @@ impl Migration {
                 reason: "sql must not be blank",
             });
         }
-        if let MigrationBody::PublishedLegacy {
-            expected_checksum, ..
-        } = &self.body
-        {
-            let actual = self.checksum_for(Dialect::Postgres);
-            if expected_checksum != &actual {
-                return Err(MigrationError::PublishedLegacyChecksumMismatch {
-                    version: self.version,
-                    expected: expected_checksum.clone(),
-                    actual,
-                });
+        match &self.body {
+            MigrationBody::PublishedLegacy {
+                expected_checksum, ..
+            } => {
+                self.verify_published_checksum("portable", Dialect::Postgres, expected_checksum)?
             }
-        } else {
-            for body in self.bodies() {
-                reject_conditional_sql(self.version, body)?;
+            MigrationBody::PublishedLegacyPerDialect {
+                postgres_expected_checksum,
+                sqlite_expected_checksum,
+                ..
+            } => {
+                self.verify_published_checksum(
+                    "postgres",
+                    Dialect::Postgres,
+                    postgres_expected_checksum,
+                )?;
+                self.verify_published_checksum(
+                    "sqlite",
+                    Dialect::Sqlite,
+                    sqlite_expected_checksum,
+                )?;
+            }
+            MigrationBody::Portable(_) | MigrationBody::PerDialect { .. } => {
+                for body in self.bodies() {
+                    reject_conditional_sql(self.version, body)?;
+                }
             }
         }
         Ok(())
+    }
+
+    fn verify_published_checksum(
+        &self,
+        body_kind: &'static str,
+        dialect: Dialect,
+        expected: &str,
+    ) -> Result<(), MigrationError> {
+        let actual = self.checksum_for(dialect);
+        if expected == actual {
+            return Ok(());
+        }
+        Err(MigrationError::PublishedLegacyChecksumMismatch {
+            version: self.version,
+            body_kind,
+            expected: expected.to_string(),
+            actual,
+        })
     }
 }
 
@@ -821,10 +891,11 @@ pub enum MigrationError {
     #[error("migration V{version:04} contains non-deterministic clause '{clause}'")]
     ConditionalSql { version: i64, clause: &'static str },
     #[error(
-        "published legacy migration V{version:04} checksum mismatch: expected {expected}, actual {actual}"
+        "published legacy migration V{version:04} {body_kind} checksum mismatch: expected {expected}, actual {actual}"
     )]
     PublishedLegacyChecksumMismatch {
         version: i64,
+        body_kind: &'static str,
         expected: String,
         actual: String,
     },
@@ -1112,6 +1183,7 @@ mod deterministic_sql_tests {
          * R3 changed historical SQL + pinned checksum => construction fails before
          *     bundle/runner I/O with PublishedLegacyChecksumMismatch.
          * R4 blank historical SQL => ordinary InvalidMigration still applies.
+         * R5 per-dialect historical SQL pins and verifies each backend separately.
          */
         const SQL: &str = "DROP TABLE IF EXISTS t";
         const RECORDED: &str = "23af8cff460d4d273c4642a49382ce9b596296abb7527c9ceaafe3e01f085bab";
@@ -1147,6 +1219,40 @@ mod deterministic_sql_tests {
             MigrationError::InvalidMigration {
                 version: 7,
                 reason: "sql must not be blank"
+            }
+        ));
+
+        const PG_SQL: &str = "ALTER TABLE t ADD COLUMN n BIGINT";
+        const PG_RECORDED: &str =
+            "20944a73d2a725a8715c98dcb86f5173eb011b67883f2fab8671c5d8fcd7785a";
+        const SQLITE_SQL: &str = "CREATE INDEX IF NOT EXISTS t_n ON t (n)";
+        const SQLITE_RECORDED: &str =
+            "145cf2f1d1c1266e6e8b687055d2f3c292e79c3526cbd5c49555dabe07a0dd47";
+        let per_dialect = Migration::published_legacy_per_dialect(
+            8,
+            "published dialect split",
+            PG_SQL,
+            PG_RECORDED,
+            SQLITE_SQL,
+            SQLITE_RECORDED,
+        )
+        .expect("both historical dialect checksums match");
+        assert_eq!(per_dialect.checksum_for(Dialect::Postgres), PG_RECORDED);
+        assert_eq!(per_dialect.checksum_for(Dialect::Sqlite), SQLITE_RECORDED);
+        assert!(matches!(
+            Migration::published_legacy_per_dialect(
+                8,
+                "drifted sqlite",
+                PG_SQL,
+                PG_RECORDED,
+                "CREATE INDEX t_n ON t (n)",
+                SQLITE_RECORDED,
+            )
+            .unwrap_err(),
+            MigrationError::PublishedLegacyChecksumMismatch {
+                version: 8,
+                body_kind: "sqlite",
+                ..
             }
         ));
     }
