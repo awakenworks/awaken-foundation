@@ -233,11 +233,21 @@ pub fn render(template: &str, dialect: Dialect, prefix: &str) -> String {
 /// token template with the same checksum on every backend. The
 /// [`PerDialect`](MigrationBody::PerDialect) escape hatch carries one body per
 /// dialect and is checksummed per the *selected* dialect, opting out of
-/// dialect-independence explicitly.
+/// dialect-independence explicitly. [`PublishedLegacy`](MigrationBody::PublishedLegacy)
+/// preserves an already-recorded body that predates deterministic-SQL admission;
+/// its pinned checksum prevents this compatibility boundary from becoming an
+/// authoring escape hatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MigrationBody {
     Portable(String),
-    PerDialect { postgres: String, sqlite: String },
+    PerDialect {
+        postgres: String,
+        sqlite: String,
+    },
+    PublishedLegacy {
+        sql: String,
+        expected_checksum: String,
+    },
 }
 
 /// One ordered SQL migration inside a named bundle.
@@ -292,6 +302,33 @@ impl Migration {
         Ok(migration)
     }
 
+    /// Preserve one already-published portable migration whose exact checksum is
+    /// present in a durable ledger but whose SQL predates current deterministic
+    /// admission (for example, it contains `IF EXISTS`).
+    ///
+    /// This is a compatibility constructor, not an authoring escape hatch. The
+    /// caller must pin the historically recorded checksum; construction and
+    /// bundle validation recompute it from `(version, sql)` and fail if either
+    /// changes. New migrations must use [`Migration::new`] or
+    /// [`Migration::per_dialect`] and remain subject to deterministic-SQL checks.
+    pub fn published_legacy(
+        version: i64,
+        description: impl Into<String>,
+        sql: impl Into<String>,
+        expected_checksum: impl Into<String>,
+    ) -> Result<Self, MigrationError> {
+        let migration = Self {
+            version,
+            description: description.into(),
+            body: MigrationBody::PublishedLegacy {
+                sql: sql.into(),
+                expected_checksum: expected_checksum.into(),
+            },
+        };
+        migration.validate()?;
+        Ok(migration)
+    }
+
     #[must_use]
     pub const fn version(&self) -> i64 {
         self.version
@@ -337,6 +374,7 @@ impl Migration {
                 Dialect::Postgres => postgres,
                 Dialect::Sqlite => sqlite,
             },
+            MigrationBody::PublishedLegacy { sql, .. } => sql,
         }
     }
 
@@ -349,6 +387,7 @@ impl Migration {
             MigrationBody::PerDialect { postgres, sqlite } => {
                 vec![postgres.as_str(), sqlite.as_str()]
             }
+            MigrationBody::PublishedLegacy { sql, .. } => vec![sql.as_str()],
         }
     }
 
@@ -399,8 +438,22 @@ impl Migration {
                 reason: "sql must not be blank",
             });
         }
-        for body in self.bodies() {
-            reject_conditional_sql(self.version, body)?;
+        if let MigrationBody::PublishedLegacy {
+            expected_checksum, ..
+        } = &self.body
+        {
+            let actual = self.checksum_for(Dialect::Postgres);
+            if expected_checksum != &actual {
+                return Err(MigrationError::PublishedLegacyChecksumMismatch {
+                    version: self.version,
+                    expected: expected_checksum.clone(),
+                    actual,
+                });
+            }
+        } else {
+            for body in self.bodies() {
+                reject_conditional_sql(self.version, body)?;
+            }
         }
         Ok(())
     }
@@ -767,6 +820,14 @@ pub enum MigrationError {
     InvalidMigration { version: i64, reason: &'static str },
     #[error("migration V{version:04} contains non-deterministic clause '{clause}'")]
     ConditionalSql { version: i64, clause: &'static str },
+    #[error(
+        "published legacy migration V{version:04} checksum mismatch: expected {expected}, actual {actual}"
+    )]
+    PublishedLegacyChecksumMismatch {
+        version: i64,
+        expected: String,
+        actual: String,
+    },
     #[error("bundle '{bundle_id}' contains duplicate migration version V{version:04}")]
     DuplicateMigrationVersion { bundle_id: String, version: i64 },
     #[error(
@@ -1040,6 +1101,54 @@ mod deterministic_sql_tests {
             "-- CREATE TABLE IF NOT EXISTS ignored\nSELECT 'DROP TABLE IF EXISTS ignored'",
         )
         .expect("comments and literals are not commands");
+    }
+
+    #[test]
+    fn published_legacy_requires_the_exact_recorded_checksum() {
+        /* Cause/effect compatibility decision table:
+         * R1 ordinary conditional SQL => ConditionalSql (no new authoring bypass).
+         * R2 published historical SQL + exact recorded checksum => accepted;
+         *     plan applies it on an empty ledger and skips a matching ledger row.
+         * R3 changed historical SQL + pinned checksum => construction fails before
+         *     bundle/runner I/O with PublishedLegacyChecksumMismatch.
+         * R4 blank historical SQL => ordinary InvalidMigration still applies.
+         */
+        const SQL: &str = "DROP TABLE IF EXISTS t";
+        const RECORDED: &str = "23af8cff460d4d273c4642a49382ce9b596296abb7527c9ceaafe3e01f085bab";
+
+        assert!(matches!(
+            Migration::new(7, "ordinary", SQL).unwrap_err(),
+            MigrationError::ConditionalSql { version: 7, .. }
+        ));
+        let historical = Migration::published_legacy(
+            7,
+            "published before deterministic admission",
+            SQL,
+            RECORDED,
+        )
+        .expect("the exact published bytes remain representable");
+        assert_eq!(historical.checksum_for(Dialect::Sqlite), RECORDED);
+        let bundle = MigrationBundle::new("test.legacy", vec![historical]).unwrap();
+        assert_eq!(
+            plan(&bundle, &BTreeMap::new(), Dialect::Sqlite)
+                .unwrap()
+                .len(),
+            1
+        );
+        let applied = BTreeMap::from([(7, RECORDED.to_string())]);
+        assert!(plan(&bundle, &applied, Dialect::Sqlite).unwrap().is_empty());
+
+        assert!(matches!(
+            Migration::published_legacy(7, "rewritten", "DROP TABLE t", RECORDED).unwrap_err(),
+            MigrationError::PublishedLegacyChecksumMismatch { version: 7, .. }
+        ));
+        assert!(matches!(
+            Migration::published_legacy(7, "blank", "  ", RECORDED).unwrap_err(),
+            MigrationError::InvalidMigration {
+                version: 7,
+                reason: "sql must not be blank"
+            }
+        ));
     }
 
     #[test]

@@ -374,6 +374,10 @@ a check in the next section.
    recording a lie; a bare `CREATE TABLE` fails loudly and surfaces the
    inconsistency. The ledger bootstrap follows the same rule: it probes under a
    lock and then executes unconditional creation, so there is no exception.
+   A migration already recorded before this rule may use
+   `Migration::published_legacy` with its exact recorded checksum; this preserves
+   immutable history through the same runner and cannot authorize new or edited
+   SQL. See [ADR-0006](../adr/0006-published-legacy-migration-compatibility.md).
 4. **Portable SQL by default.** Use the token vocabulary (`{prefix}`, `{json}`,
    `{timestamptz}`, …) so one template serves both backends; raw dialect types only
    via the escape hatch.
