@@ -253,8 +253,10 @@ enum MigrationBody {
     PublishedLegacyPerDialect {
         postgres: String,
         postgres_expected_checksum: String,
+        postgres_accepted_checksum_aliases: Vec<String>,
         sqlite: String,
         sqlite_expected_checksum: String,
+        sqlite_accepted_checksum_aliases: Vec<String>,
     },
 }
 
@@ -391,8 +393,53 @@ impl Migration {
             body: MigrationBody::PublishedLegacyPerDialect {
                 postgres: postgres.into(),
                 postgres_expected_checksum: postgres_expected_checksum.into(),
+                postgres_accepted_checksum_aliases: Vec::new(),
                 sqlite: sqlite.into(),
                 sqlite_expected_checksum: sqlite_expected_checksum.into(),
+                sqlite_accepted_checksum_aliases: Vec::new(),
+            },
+        };
+        migration.validate()?;
+        Ok(migration)
+    }
+
+    /// Preserve canonical published bodies for both dialects while accepting a
+    /// closed set of alternate historical receipt checksums for each backend.
+    /// Aliases only verify receipts; the canonical dialect body remains the sole
+    /// body applied when that version is absent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn published_legacy_per_dialect_with_aliases<PI, PS, SI, SS>(
+        version: i64,
+        description: impl Into<String>,
+        postgres: impl Into<String>,
+        postgres_expected_checksum: impl Into<String>,
+        postgres_accepted_checksum_aliases: PI,
+        sqlite: impl Into<String>,
+        sqlite_expected_checksum: impl Into<String>,
+        sqlite_accepted_checksum_aliases: SI,
+    ) -> Result<Self, MigrationError>
+    where
+        PI: IntoIterator<Item = PS>,
+        PS: Into<String>,
+        SI: IntoIterator<Item = SS>,
+        SS: Into<String>,
+    {
+        let migration = Self {
+            version,
+            description: description.into(),
+            body: MigrationBody::PublishedLegacyPerDialect {
+                postgres: postgres.into(),
+                postgres_expected_checksum: postgres_expected_checksum.into(),
+                postgres_accepted_checksum_aliases: postgres_accepted_checksum_aliases
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+                sqlite: sqlite.into(),
+                sqlite_expected_checksum: sqlite_expected_checksum.into(),
+                sqlite_accepted_checksum_aliases: sqlite_accepted_checksum_aliases
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
             },
         };
         migration.validate()?;
@@ -524,19 +571,17 @@ impl Migration {
                 ..
             } => {
                 self.verify_published_checksum("portable", Dialect::Postgres, expected_checksum)?;
-                let mut identities = BTreeSet::from([expected_checksum.as_str()]);
-                for alias in accepted_checksum_aliases {
-                    if !is_sha256_hex(alias) || !identities.insert(alias.as_str()) {
-                        return Err(MigrationError::InvalidMigration {
-                            version: self.version,
-                            reason: "published checksum aliases must be unique lowercase SHA-256 values distinct from the canonical checksum",
-                        });
-                    }
-                }
+                validate_checksum_aliases(
+                    self.version,
+                    expected_checksum,
+                    accepted_checksum_aliases,
+                )?;
             }
             MigrationBody::PublishedLegacyPerDialect {
                 postgres_expected_checksum,
+                postgres_accepted_checksum_aliases,
                 sqlite_expected_checksum,
+                sqlite_accepted_checksum_aliases,
                 ..
             } => {
                 self.verify_published_checksum(
@@ -548,6 +593,16 @@ impl Migration {
                     "sqlite",
                     Dialect::Sqlite,
                     sqlite_expected_checksum,
+                )?;
+                validate_checksum_aliases(
+                    self.version,
+                    postgres_expected_checksum,
+                    postgres_accepted_checksum_aliases,
+                )?;
+                validate_checksum_aliases(
+                    self.version,
+                    sqlite_expected_checksum,
+                    sqlite_accepted_checksum_aliases,
                 )?;
             }
             MigrationBody::Portable(_) | MigrationBody::PerDialect { .. } => {
@@ -581,14 +636,54 @@ impl Migration {
         if recorded == self.checksum_for(dialect) {
             return true;
         }
-        matches!(
-            &self.body,
-            MigrationBody::PublishedLegacy {
-                accepted_checksum_aliases,
-                ..
-            } if accepted_checksum_aliases.iter().any(|alias| alias == recorded)
-        )
+        match (&self.body, dialect) {
+            (
+                MigrationBody::PublishedLegacy {
+                    accepted_checksum_aliases,
+                    ..
+                },
+                _,
+            ) => accepted_checksum_aliases
+                .iter()
+                .any(|alias| alias == recorded),
+            (
+                MigrationBody::PublishedLegacyPerDialect {
+                    postgres_accepted_checksum_aliases,
+                    ..
+                },
+                Dialect::Postgres,
+            ) => postgres_accepted_checksum_aliases
+                .iter()
+                .any(|alias| alias == recorded),
+            (
+                MigrationBody::PublishedLegacyPerDialect {
+                    sqlite_accepted_checksum_aliases,
+                    ..
+                },
+                Dialect::Sqlite,
+            ) => sqlite_accepted_checksum_aliases
+                .iter()
+                .any(|alias| alias == recorded),
+            _ => false,
+        }
     }
+}
+
+fn validate_checksum_aliases(
+    version: i64,
+    canonical: &str,
+    aliases: &[String],
+) -> Result<(), MigrationError> {
+    let mut identities = BTreeSet::from([canonical]);
+    for alias in aliases {
+        if !is_sha256_hex(alias) || !identities.insert(alias.as_str()) {
+            return Err(MigrationError::InvalidMigration {
+                version,
+                reason: "published checksum aliases must be unique lowercase SHA-256 values distinct from the canonical checksum",
+            });
+        }
+    }
+    Ok(())
 }
 
 fn is_sha256_hex(value: &str) -> bool {
@@ -1258,6 +1353,8 @@ mod deterministic_sql_tests {
          * R7 undeclared receipt => ChecksumMismatch remains fail-closed.
          * R8 malformed, duplicate, or canonical-equal aliases => construction
          *     fails, so an alias cannot become an unreviewed wildcard.
+         * R9 per-dialect aliases are scoped to their named backend; each exact
+         *     alias skips there, while cross-dialect or malformed aliases fail.
          */
         const SQL: &str = "DROP TABLE IF EXISTS t";
         const RECORDED: &str = "23af8cff460d4d273c4642a49382ce9b596296abb7527c9ceaafe3e01f085bab";
@@ -1374,6 +1471,49 @@ mod deterministic_sql_tests {
                 body_kind: "sqlite",
                 ..
             }
+        ));
+
+        const PG_ALIAS: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        const SQLITE_ALIAS: &str =
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let per_dialect_aliased = Migration::published_legacy_per_dialect_with_aliases(
+            8,
+            "two published dialect tracks",
+            PG_SQL,
+            PG_RECORDED,
+            [PG_ALIAS],
+            SQLITE_SQL,
+            SQLITE_RECORDED,
+            [SQLITE_ALIAS],
+        )
+        .expect("each backend accepts only its declared historical identity");
+        let bundle = MigrationBundle::new("test.per-dialect-alias", vec![per_dialect_aliased])
+            .expect("bundle");
+        for (dialect, checksum) in [
+            (Dialect::Postgres, PG_ALIAS),
+            (Dialect::Sqlite, SQLITE_ALIAS),
+        ] {
+            let ledger = BTreeMap::from([(8, checksum.to_string())]);
+            assert!(plan(&bundle, &ledger, dialect).unwrap().is_empty());
+        }
+        let crossed = BTreeMap::from([(8, SQLITE_ALIAS.to_string())]);
+        assert!(matches!(
+            plan(&bundle, &crossed, Dialect::Postgres).unwrap_err(),
+            MigrationError::ChecksumMismatch { version: 8, .. }
+        ));
+        assert!(matches!(
+            Migration::published_legacy_per_dialect_with_aliases(
+                8,
+                "malformed dialect alias",
+                PG_SQL,
+                PG_RECORDED,
+                ["short"],
+                SQLITE_SQL,
+                SQLITE_RECORDED,
+                [SQLITE_ALIAS],
+            )
+            .unwrap_err(),
+            MigrationError::InvalidMigration { version: 8, .. }
         ));
     }
 

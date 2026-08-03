@@ -21,9 +21,11 @@ ledger rewrite would create a second path and destroy the drift guarantee.
 ## Decision
 
 `Migration` will expose compatibility constructors for portable and per-dialect
-historical bodies: `published_legacy` and `published_legacy_per_dialect`. They
-preserve migrations that predate deterministic admission while requiring the
-caller to pin every checksum already recorded by supported backends.
+historical bodies: `published_legacy` and `published_legacy_per_dialect`, plus
+closed-alias variants for each. They preserve migrations that predate
+deterministic admission while requiring the caller to pin every checksum already
+recorded by supported backends. Per-dialect aliases remain scoped to their named
+backend and cannot verify a receipt from the other dialect.
 
 If two released numbering tracks assigned different immutable bodies to the same
 version but their completed bundles converge to the same schema,
