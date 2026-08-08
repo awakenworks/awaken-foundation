@@ -1200,6 +1200,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
+mod validation_tests;
+
+#[cfg(test)]
 mod checksum_tests {
     use super::*;
 

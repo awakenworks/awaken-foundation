@@ -547,4 +547,94 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, MigrationError::DuplicateBundle(id) if id == "runtime.core"));
     }
+
+    #[test]
+    fn runs_multiple_distinct_bundles_in_registration_order() {
+        // Cause/effect rule: two unique bundle ids sharing one connection ->
+        // both independent version tracks apply in registration order, their
+        // three receipts retain the owning bundle id, and all terminal tables
+        // exist. Duplicate ids are covered by the adjacent failure-path test.
+        let conn = Connection::open_in_memory().unwrap();
+        let runner = SqliteMigrationRunner::with_prefix("awaken").unwrap();
+        let audit = MigrationBundle::new(
+            "gateway.audit",
+            vec![
+                Migration::new(1, "create log", "CREATE TABLE log (id TEXT PRIMARY KEY)").unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let applied = runner.run_bundles(&conn, &[bundle(), audit]).unwrap();
+        assert_eq!(applied.len(), 3);
+        assert_eq!(applied[0].bundle_id, "runtime.core");
+        assert_eq!(applied[2].bundle_id, "gateway.audit");
+        for table in ["a", "b", "log"] {
+            assert!(table_exists(&conn, table));
+        }
+    }
+
+    #[test]
+    fn records_the_configured_applied_by_actor() {
+        // Cause/effect decision table: R1 no override -> every new receipt uses
+        // the crate identity; R2 explicit override -> every new receipt uses
+        // that actor. Both rules write to the prefix-owned ledger and pin its
+        // public table projection.
+        for (configured, expected) in [
+            (None, "awaken-scoped-migration"),
+            (Some("control-plane"), "control-plane"),
+        ] {
+            let conn = Connection::open_in_memory().unwrap();
+            let mut runner = SqliteMigrationRunner::with_prefix("awaken").unwrap();
+            if let Some(actor) = configured {
+                runner = runner.with_applied_by(actor);
+            }
+            assert_eq!(runner.ledger_table(), "awaken_schema_migrations");
+            runner.run_bundle(&conn, &bundle()).unwrap();
+
+            let actors = conn
+                .prepare("SELECT applied_by FROM awaken_schema_migrations ORDER BY version")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(actors, vec![expected, expected]);
+        }
+    }
+
+    #[test]
+    fn releases_the_applier_guard_after_apply_failure() {
+        // Cause/effect rule: valid bookkeeping state + invalid migration SQL ->
+        // Backend(apply), transaction rollback, no receipt or partial table,
+        // and the IMMEDIATE guard is released. A subsequent valid run on the
+        // same connection is the observable retry/terminal-success proof.
+        let conn = Connection::open_in_memory().unwrap();
+        let runner = SqliteMigrationRunner::with_prefix("awaken").unwrap();
+        runner.ensure_ledger(&conn).unwrap();
+        let broken = MigrationBundle::new(
+            "runtime.core",
+            vec![Migration::new(1, "broken", "THIS IS NOT VALID SQL").unwrap()],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            runner.run_bundle(&conn, &broken).unwrap_err(),
+            MigrationError::Backend {
+                operation: "sqlite_migration_apply",
+                ..
+            }
+        ));
+        let receipt_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM awaken_schema_migrations WHERE bundle_id = 'runtime.core'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(receipt_count, 0);
+
+        let applied = runner.run_bundle(&conn, &bundle()).unwrap();
+        assert_eq!(applied.len(), 2);
+        assert!(table_exists(&conn, "a"));
+    }
 }

@@ -6,9 +6,10 @@
   "engines": { "node": ">=20", "pnpm": ">=10" },
   "scripts": {
     "hooks:install": "lefthook install",
-    "check": "pnpm check:guardrails && pnpm check:backend",
+    "check": "pnpm check:guardrails && pnpm check:backend && pnpm check:coverage",
     "check:guardrails": "cargo run -p xtask -- guardrail-lints",
-    "check:backend": "cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D clippy::correctness && cargo test && cargo deny check"
+    "check:backend": "cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D clippy::correctness && cargo test && cargo deny check",
+    "check:coverage": "bash scripts/ci/check-coverage.sh"
   },
   "devDependencies": { "lefthook": "^2.1.0" }
 }
