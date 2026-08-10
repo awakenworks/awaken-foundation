@@ -14,7 +14,10 @@ pub mod query;
 pub use auth::{
     ApiKeyLocation, AuthRequirement, AuthScheme, ConnectionAuth, CredentialRef, OAuth2Flow,
 };
-pub use console::{SUITE_NAVIGATION_PATH, SuiteNavigation};
+pub use console::{
+    SUITE_CONTINUATION_PARAMETER, SUITE_NAVIGATION_PATH, SuiteNavigation,
+    suite_navigation_browser_module,
+};
 pub use error::{
     AI_SDK_UI_MESSAGE_STREAM_HEADER, AI_SDK_UI_MESSAGE_STREAM_V1, AgUiRunErrorEvent, AiSdkDataPart,
     AiSdkErrorPart, ApiError, ErrorSource, FieldError, PROBLEM_JSON_CONTENT_TYPE, ProblemType,

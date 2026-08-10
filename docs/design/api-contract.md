@@ -38,6 +38,23 @@ at their deployment boundary and serve this inert projection from the constant
 The same DTO is consumed by Awaken and Awaken Flow. This earns its Foundation
 placement under ADR-0001 while preventing two handwritten wire contracts.
 
+### Browser continuation decision
+
+The two product consoles also consume one generated, product-neutral browser
+decision. Given the inert `SuiteNavigation`, the canonical product-session
+bearer value, and the current absolute browser URL, it either keeps the browser
+in the product or appends that URL to the exact hub as the `continue` query
+parameter. The current URL remains untrusted input: Foundation only transports
+it, while the composing hub validates product origin, tenant Workspace prefix,
+and deployment routing before it can issue a launch capability.
+
+The decision owns no fetch, React state, product route, identity lookup,
+authorization, or redirect side effect. Its TypeScript projection is generated
+from the Foundation-owned source so Awaken and Awaken Flow do not maintain two
+handwritten implementations. A missing hub retains standalone behavior; an
+existing bearer retains the current hosted product; an unauthenticated hosted
+entry returns to the exact configured hub with the current URL encoded once.
+
 ## Query shape
 
 Canonical list endpoints should accept:

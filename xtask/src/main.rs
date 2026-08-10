@@ -22,11 +22,42 @@ const FOUNDATION_CRATES: &[&str] = &[
 fn main() -> ExitCode {
     match std::env::args().nth(1).unwrap_or_default().as_str() {
         "guardrail-lints" => guardrail_lints(),
+        "suite-navigation-browser" => generate_suite_navigation_browser(),
         other => {
-            eprintln!("unknown task: {other:?}; expected `guardrail-lints`");
+            eprintln!(
+                "unknown task: {other:?}; expected `guardrail-lints` or `suite-navigation-browser`"
+            );
             ExitCode::FAILURE
         }
     }
+}
+
+fn generate_suite_navigation_browser() -> ExitCode {
+    let args = std::env::args().skip(2).collect::<Vec<_>>();
+    let [flag, output] = args.as_slice() else {
+        eprintln!("usage: cargo run -p xtask -- suite-navigation-browser --output <path>");
+        return ExitCode::FAILURE;
+    };
+    if flag != "--output" {
+        eprintln!("suite-navigation-browser requires --output <path>");
+        return ExitCode::FAILURE;
+    }
+    let output = Path::new(output);
+    if let Some(parent) = output.parent()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        eprintln!("create {}: {error}", parent.display());
+        return ExitCode::FAILURE;
+    }
+    if let Err(error) = std::fs::write(
+        output,
+        awaken_api_contract::suite_navigation_browser_module(),
+    ) {
+        eprintln!("write {}: {error}", output.display());
+        return ExitCode::FAILURE;
+    }
+    println!("generated {}", output.display());
+    ExitCode::SUCCESS
 }
 
 fn guardrail_lints() -> ExitCode {

@@ -73,6 +73,21 @@ serve the projection; the composing platform owns the destination. This is one
 shared wire contract for two existing cross-product consumers, not a new
 navigation service or product model.
 
+### Amendment: one generated browser-continuation decision (2026-08-10)
+
+The two existing browser consumers also need the same pure decision at direct
+hosted entry: an exact hub plus an absent canonical product bearer returns to
+the hub with the current absolute product URL encoded as untrusted continuation;
+all other rows continue locally. Foundation owns one generator-backed
+TypeScript projection of that decision beside `SuiteNavigation`.
+
+This does not make Foundation an identity, route, or topology owner. The input
+bearer is tested only for presence and is never acquired, parsed, persisted, or
+authorized; the returned continuation is not trusted. Products still own their
+routes and effects, IAM owns the bearer and PKCE flow, and the composing Cloud
+hub alone validates the requested origin and tenant Workspace before issuing an
+opaque launch URL.
+
 ## Consequences
 
 - Easier: products and the common service share one base without cross-product coupling; the
