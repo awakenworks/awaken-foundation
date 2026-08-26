@@ -243,13 +243,22 @@ impl Dialect {
 /// untouched — it is raw dialect SQL the author wrote deliberately.
 #[must_use]
 pub fn render(template: &str, dialect: Dialect, prefix: &str) -> String {
-    template
+    let rendered = template
         .replace("{prefix}", prefix)
         .replace("{json}", dialect.json())
         .replace("{timestamptz}", dialect.timestamptz())
         .replace("{now}", dialect.now())
         .replace("{blob}", dialect.blob())
-        .replace("{pk_autoinc}", dialect.pk_autoinc())
+        .replace("{pk_autoinc}", dialect.pk_autoinc());
+    match dialect {
+        // Published portable bundles use SQLite's unbounded INTEGER as their
+        // neutral whole-number spelling. PostgreSQL's INTEGER is only INT4, so
+        // preserve the established portable contract by widening column type
+        // declarations to BIGINT at render time. Checksums remain over the
+        // unchanged portable template.
+        Dialect::Postgres => rendered.replace(" INTEGER", " BIGINT"),
+        Dialect::Sqlite => rendered,
+    }
 }
 
 /// A migration's SQL body.
@@ -1945,12 +1954,17 @@ mod render_tests {
 
     #[test]
     fn renders_every_token_for_postgres() {
-        let sql = render(TEMPLATE, Dialect::Postgres, "awaken");
+        let sql = render(
+            &format!("{TEMPLATE}; CREATE TABLE awaken_count (value INTEGER)"),
+            Dialect::Postgres,
+            "awaken",
+        );
         assert!(sql.contains("CREATE TABLE awaken_event ("));
         assert!(sql.contains("id BIGSERIAL PRIMARY KEY,"));
         assert!(sql.contains("payload JSONB NOT NULL,"));
         assert!(sql.contains("body BYTEA,"));
         assert!(sql.contains("created_at TIMESTAMPTZ NOT NULL DEFAULT now()"));
+        assert!(sql.contains("CREATE TABLE awaken_count (value BIGINT)"));
         // No token survives rendering.
         assert!(!sql.contains('{'));
     }
