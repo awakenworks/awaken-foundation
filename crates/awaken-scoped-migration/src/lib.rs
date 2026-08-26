@@ -97,6 +97,31 @@ impl LedgerSchema {
         }
     }
 
+    /// Require the complete bookkeeping generation for a read-only verifier.
+    ///
+    /// Unlike bootstrap, verification must never turn an absent namespace into
+    /// a create decision: applications report the missing ledger and leave DDL
+    /// exclusively to the migration command.
+    pub fn verify_presence(
+        &self,
+        ledger_exists: bool,
+        meta_exists: bool,
+    ) -> Result<(), MigrationError> {
+        match (ledger_exists, meta_exists) {
+            (true, true) => Ok(()),
+            (false, false) => Err(MigrationError::MissingLedger {
+                ledger_table: self.ledger_table.clone(),
+                meta_table: self.meta_table.clone(),
+            }),
+            _ => Err(MigrationError::IncompleteLedger {
+                ledger_table: self.ledger_table.clone(),
+                meta_table: self.meta_table.clone(),
+                ledger_exists,
+                meta_exists,
+            }),
+        }
+    }
+
     /// Unconditional, generation-stamped bootstrap statements for a fresh
     /// namespace. Callers execute these only after [`Self::bootstrap_action`]
     /// returns [`LedgerBootstrapAction::Create`] while holding the bootstrap
@@ -1106,6 +1131,11 @@ pub enum MigrationError {
     },
     #[error("ledger metadata table '{meta_table}' must contain exactly one row, found {found}")]
     LedgerMetadataRowCount { meta_table: String, found: usize },
+    #[error("database has no migration ledger ('{ledger_table}', '{meta_table}')")]
+    MissingLedger {
+        ledger_table: String,
+        meta_table: String,
+    },
     #[error(
         "incomplete migration ledger: '{ledger_table}' exists={ledger_exists}, '{meta_table}' exists={meta_exists}"
     )]
@@ -1545,6 +1575,29 @@ mod deterministic_sql_tests {
                     meta_exists: found_meta,
                     ..
                 } if found_ledger == ledger_exists && found_meta == meta_exists
+            ));
+        }
+    }
+
+    #[test]
+    fn ledger_verification_never_bootstraps_an_absent_namespace() {
+        // The application-side decision table is intentionally distinct from
+        // bootstrap: absent/absent is a typed operational prerequisite, both
+        // present is readable, and either split generation fails closed.
+        let schema = LedgerSchema::with_prefix("runtime").unwrap();
+        assert!(matches!(
+            schema.verify_presence(false, false),
+            Err(MigrationError::MissingLedger { .. })
+        ));
+        assert!(schema.verify_presence(true, true).is_ok());
+        for (ledger_exists, meta_exists) in [(true, false), (false, true)] {
+            assert!(matches!(
+                schema.verify_presence(ledger_exists, meta_exists),
+                Err(MigrationError::IncompleteLedger {
+                    ledger_exists: found_ledger,
+                    meta_exists: found_meta,
+                    ..
+                }) if found_ledger == ledger_exists && found_meta == meta_exists
             ));
         }
     }

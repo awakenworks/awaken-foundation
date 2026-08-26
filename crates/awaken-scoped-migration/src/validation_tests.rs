@@ -243,6 +243,13 @@ fn every_error_variant_formats_its_distinguishing_context() {
             &["awaken_schema_migrations_meta", "3"],
         ),
         (
+            MigrationError::MissingLedger {
+                ledger_table: "ledger".into(),
+                meta_table: "meta".into(),
+            },
+            &["no migration ledger", "ledger", "meta"],
+        ),
+        (
             MigrationError::IncompleteLedger {
                 ledger_table: "ledger".into(),
                 meta_table: "meta".into(),

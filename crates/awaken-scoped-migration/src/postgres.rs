@@ -146,6 +146,7 @@ impl PostgresMigrationRunner {
     /// deployment migration Job; missing schema, drift, unknown versions and a
     /// pending migration all fail closed.
     pub async fn verify_bundle(&self, bundle: &MigrationBundle) -> Result<(), MigrationError> {
+        self.assert_ledger_presence().await?;
         self.assert_ledger_version().await?;
         let mut tx = self
             .pool
@@ -164,6 +165,26 @@ impl PostgresMigrationRunner {
             .await
             .map_err(pg_error("postgres_migration_verify_rollback"))?;
         Ok(())
+    }
+
+    async fn assert_ledger_presence(&self) -> Result<(), MigrationError> {
+        let presence = sqlx::query(
+            "SELECT to_regclass($1) IS NOT NULL AS ledger_exists, \
+                    to_regclass($2) IS NOT NULL AS meta_exists",
+        )
+        .bind(self.ledger.ledger_table())
+        .bind(self.ledger.meta_table())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(pg_error("postgres_migration_verify_probe"))?;
+        self.ledger.verify_presence(
+            presence
+                .try_get("ledger_exists")
+                .map_err(pg_error("postgres_migration_verify_decode"))?,
+            presence
+                .try_get("meta_exists")
+                .map_err(pg_error("postgres_migration_verify_decode"))?,
+        )
     }
 
     /// Run bundles in registration order, rejecting duplicate bundle ids.
@@ -357,7 +378,10 @@ mod tests {
         let prefix = format!("verify_{suffix}");
         let runner = PostgresMigrationRunner::with_prefix(pool.clone(), &prefix).unwrap();
 
-        assert!(runner.verify_bundle(&bundle(false)).await.is_err());
+        assert!(matches!(
+            runner.verify_bundle(&bundle(false)).await,
+            Err(MigrationError::MissingLedger { .. })
+        ));
         let ledger: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
             .bind(runner.ledger_table())
             .fetch_one(&pool)
