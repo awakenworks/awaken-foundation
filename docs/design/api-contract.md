@@ -40,6 +40,16 @@ placement under ADR-0001 while preventing two handwritten wire contracts.
 
 ### Browser continuation decision
 
+The same generated module owns pure hub visibility, product-intent URL
+construction, relative hub destinations, and hosted access-failure presentation.
+Product intent is an opaque string, not a Foundation product catalog. A new
+intent removes stale `entry`, `continue`, and fragment coordinates; an exact
+continuation removes competing product/entry intent. Destination construction
+accepts only a same-origin absolute path. Consumers own which destinations they
+expose. An authenticated scope probe's 403 or concealed 404 is terminal denial,
+401 requests authentication recovery, and other failures remain unavailable.
+These are presentation decisions, never authorization or standalone fallback.
+
 The two product consoles also consume one generated, product-neutral browser
 decision. Given the inert `SuiteNavigation`, the canonical product-session
 bearer value, and the current absolute browser URL, it either keeps the browser
