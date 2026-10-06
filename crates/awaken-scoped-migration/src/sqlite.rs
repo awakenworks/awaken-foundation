@@ -4,8 +4,9 @@
 //! and a per-bundle transaction. SQLite is single-writer, so its single-applier
 //! guard (P6) is the run transaction itself, opened with `BEGIN IMMEDIATE` to take
 //! the write lock before the ledger is read, the backend-neutral counterpart of the
-//! Postgres advisory lock. Migration bodies run through `raw_sql`, the
-//! multi-statement path, so a body may contain several statements. The apply
+//! Postgres advisory lock. Migration bodies run as unprepared-and-uncached queries;
+//! SQLite executes every statement of a multi-statement body. (`raw_sql` on a
+//! transaction would make the runner's futures `!Send`.) The apply
 //! decision is delegated to [`crate::plan`].
 //!
 //! The ledger tables, their DDL and the recorded checksums are exactly those of the
@@ -73,7 +74,8 @@ impl SqliteMigrationRunner {
             .map_err(sqlite_error("sqlite_migration_begin"))?;
         self.ensure_ledger(&mut tx).await?;
 
-        let applied_versions = self.applied_versions(&mut tx, bundle.bundle_id()).await?;
+        let applied_versions =
+            applied_versions(&mut tx, self.ledger.ledger_table(), bundle.bundle_id()).await?;
         let pending = plan(bundle, &applied_versions, DIALECT)?;
 
         let mut applied = Vec::new();
@@ -81,7 +83,8 @@ impl SqliteMigrationRunner {
             // Render the portable token template to SQLite SQL at apply time; the
             // template (not the rendered SQL) is what `plan` checksums.
             let sql = render(migration.sql_for(DIALECT), DIALECT, &self.prefix);
-            sqlx::raw_sql(&sql)
+            sqlx::query(&sql)
+                .persistent(false)
                 .execute(&mut *tx)
                 .await
                 .map_err(sqlite_error("sqlite_migration_apply"))?;
@@ -143,8 +146,14 @@ impl SqliteMigrationRunner {
             .map_err(sqlite_error("sqlite_migration_verify_begin"))?;
         let (ledger_exists, meta_exists) = self.ledger_presence(&mut tx).await?;
         self.ledger.verify_presence(ledger_exists, meta_exists)?;
-        self.assert_ledger_version(&mut tx).await?;
-        let applied_versions = self.applied_versions(&mut tx, bundle.bundle_id()).await?;
+        assert_ledger_version(
+            &mut tx,
+            self.ledger.ledger_table(),
+            self.ledger.meta_table(),
+        )
+        .await?;
+        let applied_versions =
+            applied_versions(&mut tx, self.ledger.ledger_table(), bundle.bundle_id()).await?;
         let pending = plan(bundle, &applied_versions, DIALECT)?;
         if let Some(migration) = pending.first() {
             return Err(MigrationError::PendingMigration {
@@ -168,7 +177,7 @@ impl SqliteMigrationRunner {
 
     async fn ledger_presence(
         &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        connection: &mut sqlx::SqliteConnection,
     ) -> Result<(bool, bool), MigrationError> {
         let mut exists = Vec::with_capacity(2);
         for table in [self.ledger.ledger_table(), self.ledger.meta_table()] {
@@ -176,7 +185,7 @@ impl SqliteMigrationRunner {
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
             )
             .bind(table)
-            .fetch_one(&mut **tx)
+            .fetch_one(&mut *connection)
             .await
             .map_err(sqlite_error("sqlite_migration_bootstrap_probe"))?;
             exists.push(found);
@@ -186,70 +195,79 @@ impl SqliteMigrationRunner {
 
     async fn ensure_ledger(
         &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        connection: &mut sqlx::SqliteConnection,
     ) -> Result<(), MigrationError> {
-        let (ledger_exists, meta_exists) = self.ledger_presence(tx).await?;
+        let (ledger_exists, meta_exists) = self.ledger_presence(connection).await?;
         let action = self.ledger.bootstrap_action(ledger_exists, meta_exists)?;
         if action == LedgerBootstrapAction::Create {
             for statement in self.ledger.create_statements(DIALECT) {
-                sqlx::raw_sql(&statement)
-                    .execute(&mut **tx)
+                sqlx::query(&statement)
+                    .persistent(false)
+                    .execute(&mut *connection)
                     .await
                     .map_err(sqlite_error("sqlite_migration_bootstrap_create"))?;
             }
         }
-        self.assert_ledger_version(tx).await
+        assert_ledger_version(
+            connection,
+            self.ledger.ledger_table(),
+            self.ledger.meta_table(),
+        )
+        .await
     }
+}
 
-    /// Read the stamped ledger version and fail closed unless it matches the
-    /// version this runner expects.
-    async fn assert_ledger_version(
-        &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    ) -> Result<(), MigrationError> {
-        let sql = format!("SELECT ledger_version FROM {}", self.ledger.meta_table());
-        let rows = sqlx::query(&sql)
-            .fetch_all(&mut **tx)
-            .await
-            .map_err(sqlite_error("sqlite_migration_meta_read"))?;
-        if rows.len() != 1 {
-            return Err(MigrationError::LedgerMetadataRowCount {
-                meta_table: self.ledger.meta_table().to_string(),
-                found: rows.len(),
-            });
-        }
-        let found: i64 = rows[0]
-            .try_get(0)
-            .map_err(sqlite_error("sqlite_migration_meta_decode"))?;
-        check_ledger_version(self.ledger.ledger_table(), found)
+/// Read the stamped ledger version and fail closed unless it matches the
+/// version this runner expects.
+///
+/// Free functions over a borrowed connection (rather than `&self` methods) keep
+/// every runner future provably `Send`, so callers may spawn migrations.
+async fn assert_ledger_version(
+    connection: &mut sqlx::SqliteConnection,
+    ledger_table: &str,
+    meta_table: &str,
+) -> Result<(), MigrationError> {
+    let sql = format!("SELECT ledger_version FROM {meta_table}");
+    let rows = sqlx::query(&sql)
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(sqlite_error("sqlite_migration_meta_read"))?;
+    if rows.len() != 1 {
+        return Err(MigrationError::LedgerMetadataRowCount {
+            meta_table: meta_table.to_string(),
+            found: rows.len(),
+        });
     }
+    let found: i64 = rows[0]
+        .try_get(0)
+        .map_err(sqlite_error("sqlite_migration_meta_decode"))?;
+    check_ledger_version(ledger_table, found)
+}
 
-    async fn applied_versions(
-        &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-        bundle_id: &str,
-    ) -> Result<BTreeMap<i64, String>, MigrationError> {
-        let sql = format!(
-            "SELECT version, checksum FROM {} WHERE bundle_id = ?1 ORDER BY version",
-            self.ledger.ledger_table()
-        );
-        let rows = sqlx::query(&sql)
-            .bind(bundle_id)
-            .fetch_all(&mut **tx)
-            .await
-            .map_err(sqlite_error("sqlite_migration_read_ledger"))?;
-        rows.into_iter()
-            .map(|row| {
-                let version: i64 = row
-                    .try_get(0)
-                    .map_err(sqlite_error("sqlite_migration_decode_ledger"))?;
-                let checksum: String = row
-                    .try_get(1)
-                    .map_err(sqlite_error("sqlite_migration_decode_ledger"))?;
-                Ok((version, checksum))
-            })
-            .collect()
-    }
+async fn applied_versions(
+    connection: &mut sqlx::SqliteConnection,
+    ledger_table: &str,
+    bundle_id: &str,
+) -> Result<BTreeMap<i64, String>, MigrationError> {
+    let sql = format!(
+        "SELECT version, checksum FROM {ledger_table} WHERE bundle_id = ?1 ORDER BY version"
+    );
+    let rows = sqlx::query(&sql)
+        .bind(bundle_id)
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(sqlite_error("sqlite_migration_read_ledger"))?;
+    rows.into_iter()
+        .map(|row| {
+            let version: i64 = row
+                .try_get(0)
+                .map_err(sqlite_error("sqlite_migration_decode_ledger"))?;
+            let checksum: String = row
+                .try_get(1)
+                .map_err(sqlite_error("sqlite_migration_decode_ledger"))?;
+            Ok((version, checksum))
+        })
+        .collect()
 }
 
 fn reject_duplicates(bundles: &[MigrationBundle]) -> Result<(), MigrationError> {
@@ -332,6 +350,13 @@ mod tests {
         assert_eq!(first.len(), 2);
         assert!(table_exists(&pool, "a").await);
         assert!(table_exists(&pool, "b").await);
+        let index: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_b')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(index, "every statement of a multi-statement migration runs");
         assert_eq!(first[0].description, "V0001 create a");
         let recorded: String = sqlx::query_scalar(
             "SELECT description FROM awaken_schema_migrations WHERE version = 1",
@@ -658,5 +683,22 @@ mod tests {
             !table_exists(&pool, "b").await,
             "verification must not apply DDL"
         );
+    }
+}
+
+#[cfg(test)]
+mod send_probe {
+    #![allow(dead_code)]
+    // Migration futures must be `Send` so a consumer can run them on a spawned
+    // task; this fails to compile if a change makes them `!Send`.
+    fn run_bundle_future_is_send(
+        runner: super::SqliteMigrationRunner,
+        bundle: crate::MigrationBundle,
+    ) {
+        fn assert_send<T: Send>(_: T) {}
+        assert_send(async move { runner.run_bundle(&bundle).await });
+        let _ = |runner: super::SqliteMigrationRunner, bundle: crate::MigrationBundle| {
+            assert_send(async move { runner.verify_bundle(&bundle).await })
+        };
     }
 }
