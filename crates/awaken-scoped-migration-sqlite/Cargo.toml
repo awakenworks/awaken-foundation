@@ -24,5 +24,12 @@ awaken-scoped-migration.workspace = true
 # whatever rusqlite the rest of the graph already selected. See ADR-0005.
 rusqlite = { version = ">=0.32, <0.41", features = ["bundled"] }
 
+[dev-dependencies]
+# Cross-driver compatibility: a ledger written by this runner is accepted by the
+# sqlx-driven runner in `awaken-scoped-migration` (same tables, same checksums).
+awaken-scoped-migration = { workspace = true, features = ["sqlite"] }
+sqlx = { workspace = true, features = ["runtime-tokio", "sqlite"] }
+tokio = { workspace = true, features = ["macros", "rt"] }
+
 [lints]
 workspace = true

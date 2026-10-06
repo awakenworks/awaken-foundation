@@ -5,6 +5,10 @@ All notable changes to `awaken-foundation` are recorded here.
 ## [Unreleased]
 
 ### Added
+- `awaken-scoped-migration` `sqlite` feature: an async sqlx-driven SQLite runner
+  (`sqlite::SqliteMigrationRunner`) beside the PostgreSQL runner, sharing the core
+  apply logic, ledger tables and checksums with the rusqlite runner; a database
+  migrated by either is accepted by the other ([ADR-0007](docs/adr/0007-sqlx-sqlite-runner.md)).
 - Initial foundation scaffold: Cargo workspace, governance (lefthook hooks + CI
   checks, `cargo deny`, the no-upward-dependency `xtask` guardrail), and ADRs
   0001 (foundation tier) and 0002 (configuration convention).

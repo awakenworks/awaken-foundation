@@ -637,4 +637,43 @@ mod tests {
         assert_eq!(applied.len(), 2);
         assert!(table_exists(&conn, "a"));
     }
+
+    #[tokio::test]
+    async fn a_ledger_written_here_is_accepted_by_the_sqlx_runner() {
+        // Cause/effect rule: a file database migrated by this rusqlite runner ->
+        // the sqlx runner over the same file verifies the bundle, re-applies
+        // nothing, and records no second receipt; checksums and ledger layout are
+        // shared, so switching drivers never re-runs or rejects a migration.
+        let path = std::env::temp_dir().join(format!(
+            "awaken-scoped-migration-cross-driver-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            SqliteMigrationRunner::with_prefix("awaken")
+                .unwrap()
+                .run_bundle(&conn, &bundle())
+                .unwrap();
+        }
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        let runner = awaken_scoped_migration::sqlite::SqliteMigrationRunner::with_prefix(
+            pool.clone(),
+            "awaken",
+        )
+        .unwrap();
+        runner.verify_bundle(&bundle()).await.unwrap();
+        assert!(runner.run_bundle(&bundle()).await.unwrap().is_empty());
+        let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM awaken_schema_migrations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(receipts, 2);
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
 }

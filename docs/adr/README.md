@@ -9,3 +9,4 @@ Architecture Decision Records for `awaken-foundation`. Start from the
 | [0002](0002-configuration-convention.md) | Configuration is a convention over figment, not a crate | Accepted |
 | [0003](0003-api-contract-primitives.md) | Shared API contract primitives | Proposed |
 | [0004](0004-query-engine.md) | Shared query engine | Proposed |
+| [0007](0007-sqlx-sqlite-runner.md) | Reinstate an sqlx SQLite migration runner beside the rusqlite one | Proposed |
