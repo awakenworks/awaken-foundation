@@ -1,0 +1,2 @@
+# Keep rustfmt's Unix policy and executable scripts reproducible on Windows.
+* text=auto eol=lf

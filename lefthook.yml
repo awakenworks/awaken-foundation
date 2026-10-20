@@ -7,6 +7,8 @@
 pre-commit:
   parallel: true
   commands:
+    ci-bootstrap:
+      run: python3 scripts/ci/check_ci_bootstrap.py --self-test && python3 scripts/ci/check_ci_bootstrap.py
     trust-roots:
       run: python3 scripts/ci/check_trust_roots.py --self-test && python3 scripts/ci/check_trust_roots.py
     rustfmt:
@@ -36,6 +38,8 @@ pre-commit:
 pre-push:
   parallel: false
   commands:
+    ci-bootstrap:
+      run: python3 scripts/ci/check_ci_bootstrap.py --self-test && python3 scripts/ci/check_ci_bootstrap.py
     trust-roots:
       run: python3 scripts/ci/check_trust_roots.py --self-test && python3 scripts/ci/check_trust_roots.py
     msrv:
