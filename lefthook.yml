@@ -7,6 +7,8 @@
 pre-commit:
   parallel: true
   commands:
+    trust-roots:
+      run: python3 scripts/ci/check_trust_roots.py --self-test && python3 scripts/ci/check_trust_roots.py
     rustfmt:
       glob: "*.rs"
       run: cargo fmt --all
@@ -34,6 +36,8 @@ pre-commit:
 pre-push:
   parallel: false
   commands:
+    trust-roots:
+      run: python3 scripts/ci/check_trust_roots.py --self-test && python3 scripts/ci/check_trust_roots.py
     msrv:
       # Guard the declared MSRV (rust-version in Cargo.toml). The floor is set by
       # the `time` dependency, which needs let-chains (stable since 1.88); bumping

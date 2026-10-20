@@ -10,7 +10,9 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+ignore = [
+    { id = "RUSTSEC-2026-0381", reason = "Immutable webpki-roots 0.26.11 only re-exports v1 certificate data. check_trust_roots.py pins its registry checksum and forwarding edge, rejects actual data below 1.0.10, and refuses this exception once the last shim is removed." },
+]
 
 [licenses]
 version = 2
