@@ -15,7 +15,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use sqlx::{Row, SqlitePool};
+use sqlx::{AssertSqlSafe, Row, SqlitePool};
 
 use crate::{
     AppliedMigration, Dialect, LedgerBootstrapAction, LedgerSchema, MigrationBundle,
@@ -82,8 +82,10 @@ impl SqliteMigrationRunner {
         for migration in pending {
             // Render the portable token template to SQLite SQL at apply time; the
             // template (not the rendered SQL) is what `plan` checksums.
+            // This executes the admitted Migration body, not request data. The
+            // runner prefix already passed sql_identifier at construction.
             let sql = render(migration.sql_for(DIALECT), DIALECT, &self.prefix);
-            sqlx::query(&sql)
+            sqlx::query(AssertSqlSafe(sql))
                 .persistent(false)
                 .execute(&mut *tx)
                 .await
@@ -96,7 +98,9 @@ impl SqliteMigrationRunner {
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 self.ledger.ledger_table()
             );
-            sqlx::query(&insert_sql)
+            // Only LedgerSchema's validated identifier is interpolated; all
+            // receipt data below remains bound, never part of the SQL text.
+            sqlx::query(AssertSqlSafe(insert_sql))
                 .bind(bundle.bundle_id())
                 .bind(migration.version())
                 .bind(&checksum)
@@ -200,8 +204,9 @@ impl SqliteMigrationRunner {
         let (ledger_exists, meta_exists) = self.ledger_presence(connection).await?;
         let action = self.ledger.bootstrap_action(ledger_exists, meta_exists)?;
         if action == LedgerBootstrapAction::Create {
+            // LedgerSchema alone renders these fixed bootstrap statements.
             for statement in self.ledger.create_statements(DIALECT) {
-                sqlx::query(&statement)
+                sqlx::query(AssertSqlSafe(statement))
                     .persistent(false)
                     .execute(&mut *connection)
                     .await
@@ -228,7 +233,8 @@ async fn assert_ledger_version(
     meta_table: &str,
 ) -> Result<(), MigrationError> {
     let sql = format!("SELECT ledger_version FROM {meta_table}");
-    let rows = sqlx::query(&sql)
+    // The private caller supplies the same validated LedgerSchema table names.
+    let rows = sqlx::query(AssertSqlSafe(sql))
         .fetch_all(&mut *connection)
         .await
         .map_err(sqlite_error("sqlite_migration_meta_read"))?;
@@ -252,7 +258,8 @@ async fn applied_versions(
     let sql = format!(
         "SELECT version, checksum FROM {ledger_table} WHERE bundle_id = ?1 ORDER BY version"
     );
-    let rows = sqlx::query(&sql)
+    // Only the validated ledger identifier is text; bundle identity stays bound.
+    let rows = sqlx::query(AssertSqlSafe(sql))
         .bind(bundle_id)
         .fetch_all(&mut *connection)
         .await
@@ -334,7 +341,7 @@ mod tests {
         .unwrap()
     }
 
-    async fn scalar_i64(pool: &SqlitePool, sql: &str) -> i64 {
+    async fn scalar_i64(pool: &SqlitePool, sql: impl sqlx::SqlSafeStr) -> i64 {
         sqlx::query_scalar::<_, i64>(sql)
             .fetch_one(pool)
             .await
@@ -434,16 +441,20 @@ mod tests {
         runner.run_bundle(&bundle()).await.unwrap();
         let meta = runner.ledger.meta_table().to_string();
         assert_eq!(
-            scalar_i64(&pool, &format!("SELECT ledger_version FROM {meta}")).await,
+            scalar_i64(
+                &pool,
+                AssertSqlSafe(format!("SELECT ledger_version FROM {meta}"))
+            )
+            .await,
             LEDGER_VERSION
         );
         assert_eq!(
-            scalar_i64(&pool, &format!("SELECT count(*) FROM {meta}")).await,
+            scalar_i64(&pool, AssertSqlSafe(format!("SELECT count(*) FROM {meta}"))).await,
             1
         );
         runner.run_bundle(&bundle()).await.unwrap();
         assert_eq!(
-            scalar_i64(&pool, &format!("SELECT count(*) FROM {meta}")).await,
+            scalar_i64(&pool, AssertSqlSafe(format!("SELECT count(*) FROM {meta}"))).await,
             1
         );
     }
@@ -453,10 +464,10 @@ mod tests {
         let pool = memory().await;
         let runner = SqliteMigrationRunner::with_prefix(pool.clone(), "awaken").unwrap();
         runner.run_bundle(&bundle()).await.unwrap();
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "UPDATE {} SET ledger_version = ?1",
             runner.ledger.meta_table()
-        ))
+        )))
         .bind(LEDGER_VERSION + 1)
         .execute(&pool)
         .await
@@ -504,7 +515,10 @@ mod tests {
             let pool = memory().await;
             let schema = LedgerSchema::with_prefix("awaken").unwrap();
             for statement in schema.create_statements(DIALECT).into_iter().take(2) {
-                sqlx::raw_sql(&statement).execute(&pool).await.unwrap();
+                sqlx::raw_sql(AssertSqlSafe(statement))
+                    .execute(&pool)
+                    .await
+                    .unwrap();
             }
             for _ in 0..extra_rows {
                 sqlx::query(

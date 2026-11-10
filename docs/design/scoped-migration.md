@@ -20,12 +20,13 @@ convergence below resolves it by **taking the better idea from each**.
   drift, already-applied skip), and a `MigrationError` taxonomy.
 - A **thin backend shell** per driver that fetches applied versions, calls
   `plan()`, and applies the result with its own ledger DDL and transaction:
-  `postgres` (over sqlx, async) and one canonical `sqlite` shell (over rusqlite,
-  synchronous — for callers holding a borrowed `&Connection` inside
-  `spawn_blocking`). The SQLite shell lives in
-  `awaken-scoped-migration-sqlite` so consumers using newer rusqlite releases do
-  not collide with sqlx's native SQLite dependency. There is no parallel
-  sqlx-SQLite migration shell.
+  `postgres` and `sqlite` over sqlx, async, plus the synchronous SQLite adapter
+  in `awaken-scoped-migration-sqlite` for existing borrowed `&Connection`
+  callers. These are driver-specific shells over the same planner, renderer,
+  ledger schema and checksum rules; they do not own competing migration state.
+  [ADR-0007](../adr/0007-sqlx-sqlite-runner.md) owns the existing async SQLite
+  consumer and the cross-driver ledger test. Its security amendment records the
+  one patched native SQLite dependency and the qualified DB toolchain.
 - A **per-prefix ledger** table (`{prefix}_schema_migrations`) recording
   `(bundle_id, version, checksum, description, applied_at, applied_by)`.
 - PostgreSQL exposes two deliberately different operational paths:

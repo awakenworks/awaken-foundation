@@ -4,7 +4,7 @@
 # The core planner and the sibling rusqlite shell are the in-process migration
 # surface. The optional PostgreSQL driver remains excluded because it requires a
 # live service and is validated by its integration suite. Keep the repository's
-# Rust 1.88 MSRV; llvm-tools-preview supplies the matching coverage runtime.
+# database-enabled Rust 1.96 floor; llvm-tools-preview supplies its coverage runtime.
 set -euo pipefail
 
 coverage_min_lines="${COVERAGE_MIN_LINES:-90}"

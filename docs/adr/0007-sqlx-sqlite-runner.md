@@ -66,3 +66,17 @@ not enable the core crate's sqlx.
   database.
 - **Consumers implement their own sqlx SQLite runner.** This is the duplication
   ADR-0005 removed, outside foundation and without its tests.
+
+## Security dependency amendment (2026-11-10)
+
+The current bounds and qualified toolchains are those of the
+[ADR-0005 security amendment](0005-sqlite-backend-crate-split.md#security-dependency-amendment-2026-11-10).
+The official pinned SQLx revision and the synchronous driver share the one
+patched native SQLite library. The original pool, `BEGIN IMMEDIATE`, shared
+ledger and read-only verification remain the same mechanisms.
+
+SQLx 0.9 requires an explicit `AssertSqlSafe` for dynamic SQL. Each backend marks
+only its existing trusted migration-rendering boundary or SQL built from the
+validated `LedgerSchema` identifiers. Runtime receipt values remain bound
+parameters. There is no blanket query wrapper, new SQL parser or duplicate
+migration admission rule.

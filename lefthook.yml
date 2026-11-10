@@ -39,12 +39,11 @@ pre-push:
     trust-roots:
       run: python3 scripts/ci/check_trust_roots.py --self-test && python3 scripts/ci/check_trust_roots.py
     msrv:
-      # Guard the declared MSRV (rust-version in Cargo.toml). The floor is set by
-      # the `time` dependency, which needs let-chains (stable since 1.88); bumping
-      # a dependency can raise the real floor silently. Pinned to +1.88.0 on
-      # purpose so this stays honest even if rust-toolchain.toml moves to a newer
-      # dev toolchain. Requires the 1.88.0 toolchain: `rustup toolchain install 1.88.0`.
-      run: cargo +1.88.0 check --workspace --all-targets --all-features
+      # Database drivers use the qualified 1.96 floor; unchanged database-free
+      # base crates retain their separately checked 1.88 floor.
+      run: |
+        cargo +1.96.0 check --workspace --all-targets --all-features --locked
+        cargo +1.88.0 check --locked --all-features -p awaken-api-contract -p awaken-connection -p awaken-connection-auth -p awaken-connection-transports -p awaken-query -p xtask
     clippy:
       run: cargo clippy --workspace --all-targets -- -D clippy::correctness
     guardrails:

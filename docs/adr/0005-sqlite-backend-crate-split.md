@@ -92,3 +92,24 @@ lower end (0.32, which builds on 1.88); a consumer that floats it to a newer
   path.
 - **Leave it to the consumer** (bespoke store, no shared ledger). Rejected: it
   duplicates the fail-closed ledger mechanism this tier exists to share.
+
+## Security dependency amendment (2026-11-10)
+
+RUSTSEC-2026-0459 affects the bundled engines through SQLite 3.53.2. The
+dependency bounds above describe the original split, not the current security
+floor. The synchronous shell now requires `rusqlite >=0.41.1, <0.42`, and the
+workspace locks one `libsqlite3-sys 0.39.1`, containing SQLite 3.54.1.
+
+The async shell uses the official SQLx Git revision
+`10462fa4414c6c7f1ed1d39bb31678e3b726878c`, which widens its native-library bound
+to admit 0.39.x. It is an unreleased 0.9 security revision, not a crates.io patch
+release. No fork, vendored engine, advisory exception or system-library override
+is introduced. The two existing shells still delegate to the same plan, render,
+ledger, checksum and transaction rules. The original cross-driver test checks
+the actual safe engine, replay, rollback and receipts through both drivers.
+
+Database-enabled migration packages and the development/whole-workspace gates
+use Rust 1.96, the toolchain qualified here. SQLx requires at least Rust 1.94;
+that lower DB floor is not claimed as tested. Database-free base packages retain
+their declared 1.88 floor and have a separate actual 1.88 check. The ledger schema
+and published migration bodies do not change with this dependency upgrade.

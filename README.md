@@ -39,3 +39,8 @@ only when duplication across services earns it (rule of three).
 
 See [DEVELOPMENT](DEVELOPMENT.md): `pnpm hooks:install`, then `cargo test` and
 `cargo run -p xtask -- guardrail-lints`.
+
+Database-enabled migration packages and workspace development use Rust 1.96.
+The database-free API, connection and query packages retain a separately checked
+1.88 floor. The [SQLite dependency amendment](docs/adr/0005-sqlite-backend-crate-split.md#security-dependency-amendment-2026-11-10)
+records the official SQLx security revision and single patched native engine.
