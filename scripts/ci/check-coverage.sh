@@ -3,8 +3,9 @@
 #
 # The core planner and the sibling rusqlite shell are the in-process migration
 # surface. The optional PostgreSQL driver remains excluded because it requires a
-# live service and is validated by its integration suite. Keep the repository's
-# Rust 1.88 MSRV; llvm-tools-preview supplies the matching coverage runtime.
+# live service and is validated by its integration suite. The pinned developer
+# toolchain supplies the matching coverage runtime; check-msrv.sh verifies the
+# independent non-driver and SQL-driver floors.
 set -euo pipefail
 
 coverage_min_lines="${COVERAGE_MIN_LINES:-90}"

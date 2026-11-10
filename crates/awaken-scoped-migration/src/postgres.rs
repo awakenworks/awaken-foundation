@@ -7,12 +7,15 @@
 
 use std::collections::BTreeMap;
 
-use sqlx::{PgPool, Row};
+use sqlx::{AssertSqlSafe, PgPool, Row};
 
 use crate::{
     AppliedMigration, Dialect, LedgerBootstrapAction, LedgerSchema, MigrationBundle,
     MigrationError, check_ledger_version, plan, render, sql_identifier,
 };
+
+#[cfg(test)]
+mod transaction_tests;
 
 /// The dialect this backend shell applies and checksums migrations under.
 const DIALECT: Dialect = Dialect::Postgres;
@@ -101,7 +104,9 @@ impl PostgresMigrationRunner {
             // The template (not the rendered SQL) is what `plan` checksums, so
             // the recorded identity stays dialect-independent.
             let sql = render(migration.sql_for(DIALECT), DIALECT, &self.prefix);
-            sqlx::raw_sql(&sql)
+            // Explicit migration SQL code is rendered with a validated prefix;
+            // it is not an interpolated application record value.
+            sqlx::raw_sql(AssertSqlSafe(sql))
                 .execute(&mut *tx)
                 .await
                 .map_err(pg_error("postgres_migration_apply"))?;
@@ -115,7 +120,8 @@ impl PostgresMigrationRunner {
             // The ledger records the readable `V0001`-labelled description so a
             // ledger scan reads the version label without decoding the integer.
             let description = migration.ledger_description();
-            sqlx::query(&insert_sql)
+            // LedgerSchema owns the identifier; every record value stays bound.
+            sqlx::query(AssertSqlSafe(insert_sql))
                 .bind(bundle.bundle_id())
                 .bind(migration.version())
                 .bind(&checksum)
@@ -253,7 +259,7 @@ impl PostgresMigrationRunner {
         )?;
         if action == LedgerBootstrapAction::Create {
             for statement in self.ledger.create_statements(DIALECT) {
-                sqlx::raw_sql(&statement)
+                sqlx::raw_sql(AssertSqlSafe(statement))
                     .execute(&mut *tx)
                     .await
                     .map_err(pg_error("postgres_migration_bootstrap_create"))?;
@@ -284,7 +290,8 @@ impl PostgresMigrationRunner {
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     ) -> Result<(), MigrationError> {
         let sql = format!("SELECT ledger_version FROM {}", self.ledger.meta_table());
-        let rows = sqlx::query(&sql)
+        // Only LedgerSchema's validated identifier is interpolated.
+        let rows = sqlx::query(AssertSqlSafe(sql))
             .fetch_all(&mut **tx)
             .await
             .map_err(pg_error("postgres_migration_meta_read"))?;
@@ -309,7 +316,8 @@ impl PostgresMigrationRunner {
             "SELECT version, checksum FROM {} WHERE bundle_id = $1 ORDER BY version",
             self.ledger.ledger_table()
         );
-        let rows = sqlx::query(&sql)
+        // Only the validated ledger identifier is SQL; bundle_id stays bound.
+        let rows = sqlx::query(AssertSqlSafe(sql))
             .bind(bundle_id)
             .fetch_all(&mut **tx)
             .await
@@ -408,10 +416,10 @@ mod tests {
             "verification must not apply DDL"
         );
 
-        sqlx::raw_sql(&format!(
+        sqlx::raw_sql(AssertSqlSafe(format!(
             "DROP TABLE {prefix}_item; DROP TABLE {prefix}_schema_migrations; \
              DROP TABLE {prefix}_schema_migrations_meta"
-        ))
+        )))
         .execute(&pool)
         .await
         .unwrap();

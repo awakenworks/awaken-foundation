@@ -29,7 +29,6 @@ tracing-opentelemetry = { workspace = true, optional = true, default-features = 
 
 [dev-dependencies]
 opentelemetry_sdk = { workspace = true, features = ["trace"] }
-testcontainers = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "time"] }
 tracing-subscriber = { workspace = true, features = ["registry"] }
 

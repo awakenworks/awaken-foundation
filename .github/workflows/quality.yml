@@ -30,8 +30,11 @@ jobs:
           python-version: "3.12"
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
-          toolchain: 1.88.0
+          toolchain: 1.94.0
           components: clippy,rustfmt
+      - name: Install the non-driver Rust floor
+        shell: bash
+        run: rustup toolchain install 1.88.0 --profile minimal
       - name: Verify immutable shim and patched certificate data
         shell: bash
         run: |
@@ -39,9 +42,10 @@ jobs:
           python scripts/ci/check_ci_bootstrap.py
           python scripts/ci/check_trust_roots.py --self-test
           python scripts/ci/check_trust_roots.py
-      - name: Verify the locked native workspace at its declared MSRV
+      - name: Verify the locked native workspace and both declared Rust floors
         shell: bash
         run: |
+          bash scripts/ci/check-msrv.sh
           cargo fmt --all -- --check
           cargo run --locked -p xtask -- guardrail-lints
           cargo clippy --workspace --all-features --all-targets --locked -- -D clippy::correctness

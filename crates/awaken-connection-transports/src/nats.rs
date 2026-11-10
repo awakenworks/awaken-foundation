@@ -382,7 +382,11 @@ impl AsyncWrite for NatsDuplex {
 }
 
 #[cfg(test)]
+mod test_fixture;
+
+#[cfg(test)]
 mod tests {
+    use super::test_fixture::NatsFixture;
     use super::*;
     use awaken_connection::Transport;
     use awaken_connection_auth::HeaderAuthMaterial;
@@ -394,15 +398,9 @@ mod tests {
         trace::{SdkTracerProvider, SpanData, SpanExporter},
     };
     use std::sync::{Arc, Mutex, OnceLock};
-    use testcontainers::{ContainerAsync, GenericImage, core::WaitFor, runners::AsyncRunner};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-    use tokio::time::{Duration, sleep, timeout};
+    use tokio::time::{Duration, timeout};
     use tracing_subscriber::prelude::*;
-
-    struct NatsFixture {
-        _container: ContainerAsync<GenericImage>,
-        url: String,
-    }
 
     #[derive(Clone, Debug, Default)]
     struct TestSpanExporter {
@@ -426,21 +424,6 @@ mod tests {
                 spans.lock().expect("span export lock").append(&mut batch);
                 Ok(())
             })
-        }
-    }
-
-    impl NatsFixture {
-        async fn start() -> Self {
-            let image = GenericImage::new("nats", "2.10-alpine")
-                .with_wait_for(WaitFor::message_on_stderr("Server is ready"));
-            let container = image.start().await.expect("failed to start nats container");
-            let host_port = container.get_host_port_ipv4(4222).await.expect("nats port");
-            let url = format!("nats://127.0.0.1:{host_port}");
-            sleep(Duration::from_millis(250)).await;
-            Self {
-                _container: container,
-                url,
-            }
         }
     }
 

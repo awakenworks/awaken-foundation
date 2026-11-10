@@ -33,10 +33,9 @@ reqwest = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = "0.8"
-sqlx = { version = "0.8", default-features = false }
-testcontainers = "0.27.3"
+sqlx = { git = "https://github.com/launchbadge/sqlx.git", rev = "4f22dcfd42cbc15ea7a977cb38a39ef0ce6b3be4", version = "0.9.1", default-features = false }
 thiserror = "2"
-tokio = "1"
+tokio = "1.53.3"
 tracing = "0.1"
 tracing-opentelemetry = { version = "0.29", default-features = false }
 tracing-subscriber = "0.3"
