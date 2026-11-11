@@ -148,6 +148,17 @@ and meta tables together, creates both with unconditional statements only when
 both are absent, validates when both are present, and fails closed on partial
 state. A `ledger_version` marker identifies the generation.
 
+The PostgreSQL presence probe first aggregates candidate relation OIDs from one
+ordinary `pg_class` statement snapshot, then accepts each `to_regclass` result
+only if that OID belongs to the candidate set. This prevents separately cached
+name lookups from reporting a mixed generation during concurrent bootstrap.
+PostgreSQL still resolves the names: search-path visibility, shadowing, unquoted
+identifier folding and truncation, and temporary namespaces retain their native
+semantics. In particular, the read-only verifier does not initialize a pending
+`pg_temp` namespace merely to inspect the ledger. Bootstrap and verification use
+the same probe; the namespace lock and rejection of genuine partial state remain
+unchanged.
+
 ### P8 — Two parallel implementations (the meta-problem)
 
 The common service reimplements this crate (scope-partitioned bundles, token rendering,
@@ -341,6 +352,12 @@ The convergence is "done" when these hold, mirroring the common service's suite:
 - A drifted recorded checksum fails closed in `plan()`.
 - Concurrent `run_bundle` from two connections applies each migration exactly once
   (single-applier guard).
+- PostgreSQL cold initializers queued behind the bootstrap guard both observe a
+  complete ledger generation, including reuse of a cached presence statement;
+  actual ledger-only and meta-only generations fail without repair. The same
+  presence probe preserves identifier folding and truncation, search-path
+  shadows, relation kinds, user-defined operator shadows, and uninitialized and
+  initialized temporary paths.
 - `lint` rejects: duplicate version, non-increasing version, cross-bundle table
   reference, duplicate bundle id.
 - A `per_dialect` migration round-trips and is skipped on re-run.
