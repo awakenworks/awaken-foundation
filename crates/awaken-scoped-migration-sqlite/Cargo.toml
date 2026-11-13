@@ -16,10 +16,9 @@ awaken-scoped-migration.workspace = true
 # A *range*, deliberately not a hard `^0.x` pin. `rusqlite` pulls the native,
 # `links = "sqlite3"` crate `libsqlite3-sys`, of which a dependency graph may
 # contain exactly one version. Pinning a single 0.x here is what deadlocks any
-# graph that also needs a different rusqlite (e.g. a consumer on rusqlite 0.40
-# while this pinned ^0.32). The range lets the resolver unify this backend onto
-# whatever rusqlite the rest of the graph already selected. See ADR-0005.
-rusqlite = { version = ">=0.32, <0.42", features = ["bundled"] }
+# graph that also needs a different rusqlite. The security floor retains a range
+# within the audited family while excluding affected bundled SQLite. See ADR-0005.
+rusqlite = { version = ">=0.41.1, <0.42", features = ["bundled"] }
 
 [dev-dependencies]
 # Cross-driver compatibility: a ledger written by this runner is accepted by the

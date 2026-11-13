@@ -20,6 +20,26 @@ mod transaction_tests;
 /// The dialect this backend shell applies and checksums migrations under.
 const DIALECT: Dialect = Dialect::Postgres;
 
+// The aggregate consumes the catalog snapshot before either name is resolved.
+// A relation discovered by a later syscache invalidation cannot count unless
+// its OID was already present in that snapshot. Keep to_regclass for PostgreSQL's
+// own search_path, privilege, shadowing and temporary-namespace semantics.
+// Validated names are ASCII identifiers: C-locale lower plus name preserves
+// unquoted folding and identifier truncation without a locale dependency.
+const LEDGER_PRESENCE_SQL: &str = "
+    SELECT COALESCE(pg_catalog.to_regclass($1)::pg_catalog.oid OPERATOR(pg_catalog.=)
+                       ANY(catalog_snapshot.candidate_oids), false) AS ledger_exists,
+           COALESCE(pg_catalog.to_regclass($2)::pg_catalog.oid OPERATOR(pg_catalog.=)
+                       ANY(catalog_snapshot.candidate_oids), false) AS meta_exists
+    FROM (
+        SELECT pg_catalog.array_agg(relations.oid) AS candidate_oids
+        FROM pg_catalog.pg_class AS relations
+        WHERE relations.relname OPERATOR(pg_catalog.=) ANY(ARRAY[
+            pg_catalog.lower($1 COLLATE pg_catalog.\"C\")::pg_catalog.name,
+            pg_catalog.lower($2 COLLATE pg_catalog.\"C\")::pg_catalog.name
+        ])
+    ) AS catalog_snapshot";
+
 /// PostgreSQL-backed migration runner with a per-prefix ledger table.
 #[derive(Debug, Clone)]
 pub struct PostgresMigrationRunner {
@@ -174,15 +194,12 @@ impl PostgresMigrationRunner {
     }
 
     async fn assert_ledger_presence(&self) -> Result<(), MigrationError> {
-        let presence = sqlx::query(
-            "SELECT to_regclass($1) IS NOT NULL AS ledger_exists, \
-                    to_regclass($2) IS NOT NULL AS meta_exists",
-        )
-        .bind(self.ledger.ledger_table())
-        .bind(self.ledger.meta_table())
-        .fetch_one(&self.pool)
-        .await
-        .map_err(pg_error("postgres_migration_verify_probe"))?;
+        let presence = sqlx::query(LEDGER_PRESENCE_SQL)
+            .bind(self.ledger.ledger_table())
+            .bind(self.ledger.meta_table())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(pg_error("postgres_migration_verify_probe"))?;
         self.ledger.verify_presence(
             presence
                 .try_get("ledger_exists")
@@ -240,15 +257,12 @@ impl PostgresMigrationRunner {
             .await
             .map_err(pg_error("postgres_migration_bootstrap_lock"))?;
 
-        let presence = sqlx::query(
-            "SELECT to_regclass($1) IS NOT NULL AS ledger_exists, \
-                    to_regclass($2) IS NOT NULL AS meta_exists",
-        )
-        .bind(self.ledger.ledger_table())
-        .bind(self.ledger.meta_table())
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(pg_error("postgres_migration_bootstrap_probe"))?;
+        let presence = sqlx::query(LEDGER_PRESENCE_SQL)
+            .bind(self.ledger.ledger_table())
+            .bind(self.ledger.meta_table())
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(pg_error("postgres_migration_bootstrap_probe"))?;
         let action = self.ledger.bootstrap_action(
             presence
                 .try_get("ledger_exists")
@@ -368,6 +382,525 @@ mod tests {
             );
         }
         MigrationBundle::new("foundation.verify_test", migrations).unwrap()
+    }
+
+    /// Cause/effect decision table: an application verifier cannot bootstrap a
+    /// missing ledger, accepts a fully migrated bundle, and rejects a newly
+    /// pending version without changing the database.
+    struct OwnedSchema {
+        admin: PgPool,
+        url: String,
+        name: String,
+        nonce: String,
+    }
+
+    impl OwnedSchema {
+        async fn create() -> Option<Self> {
+            let url = std::env::var("AWAKEN_TEST_POSTGRES_URL").ok()?;
+            let admin = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(3)
+                .connect(&url)
+                .await
+                .unwrap();
+            let identities = sqlx::query(
+                "SELECT md5(random()::text || clock_timestamp()::text || pg_backend_pid()::text) \
+                        AS identity, md5(random()::text || clock_timestamp()::text) AS nonce",
+            )
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+            let identity: String = identities.get("identity");
+            assert_eq!(identity.len(), 32);
+            assert!(identity.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            let name = format!("foundation_ledger_{identity}");
+            let nonce: String = identities.get("nonce");
+            assert_eq!(nonce.len(), 32);
+            assert!(nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            sqlx::raw_sql(AssertSqlSafe(format!(
+                "CREATE SCHEMA {name}; COMMENT ON SCHEMA {name} IS '{nonce}'"
+            )))
+            .execute(&admin)
+            .await
+            .unwrap();
+            println!("foundation ledger fixture: schema={name} nonce={nonce}");
+            let fixture = Self {
+                admin,
+                url,
+                name,
+                nonce,
+            };
+            fixture.assert_owner().await;
+            Some(fixture)
+        }
+
+        async fn assert_owner(&self) {
+            let owned: Option<bool> = sqlx::query_scalar(
+                "SELECT pg_get_userbyid(nspowner) = current_user \
+                    AND obj_description(oid, 'pg_namespace') = $2 \
+                 FROM pg_namespace WHERE nspname = $1",
+            )
+            .bind(&self.name)
+            .bind(&self.nonce)
+            .fetch_one(&self.admin)
+            .await
+            .unwrap();
+            assert_eq!(owned, Some(true), "refuse a foreign fixture namespace");
+        }
+
+        async fn pool(&self, application: &str) -> PgPool {
+            let pool = self.pool_on_path(application, &self.name).await;
+            let actual: String = sqlx::query_scalar("SELECT current_schema()")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(actual, self.name, "never initialize another schema");
+            pool
+        }
+
+        async fn pool_on_path(&self, application: &str, path: &str) -> PgPool {
+            let options: sqlx::postgres::PgConnectOptions = self.url.parse().unwrap();
+            sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect_with(
+                    options
+                        .application_name(application)
+                        .options([("search_path", path)]),
+                )
+                .await
+                .unwrap()
+        }
+
+        async fn cleanup(self) {
+            self.assert_owner().await;
+            sqlx::raw_sql(AssertSqlSafe(format!("DROP SCHEMA {} CASCADE", self.name)))
+                .execute(&self.admin)
+                .await
+                .unwrap();
+            self.admin.close().await;
+        }
+    }
+
+    async fn assert_presence(pool: &PgPool, ledger: &str, meta: &str, expected: (bool, bool)) {
+        let actual: (bool, bool) = sqlx::query_as(LEDGER_PRESENCE_SQL)
+            .bind(ledger)
+            .bind(meta)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(actual, expected);
+        let original_resolution: (bool, bool) = sqlx::query_as(
+            "SELECT pg_catalog.to_regclass($1) IS NOT NULL, \
+                    pg_catalog.to_regclass($2) IS NOT NULL",
+        )
+        .bind(ledger)
+        .bind(meta)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(actual, original_resolution);
+    }
+
+    async fn wait_for_bootstrap(pool: &PgPool, application: &str, ledger: &str) -> i32 {
+        loop {
+            let waiting: Vec<(i32,)> = sqlx::query_as(
+                "SELECT activity.pid FROM pg_stat_activity AS activity \
+                 JOIN pg_locks AS waiting ON waiting.pid = activity.pid \
+                 WHERE activity.datname = current_database() \
+                   AND activity.application_name = $1 \
+                   AND waiting.locktype = 'advisory' AND NOT waiting.granted \
+                   AND waiting.mode = 'ExclusiveLock' AND waiting.objsubid = 2 \
+                   AND waiting.classid::bigint = (hashtext($2)::bigint & 4294967295) \
+                   AND waiting.objid::bigint = \
+                       (hashtext('ledger-bootstrap-v1')::bigint & 4294967295)",
+            )
+            .bind(application)
+            .bind(ledger)
+            .fetch_all(pool)
+            .await
+            .unwrap();
+            match waiting.as_slice() {
+                [(pid,)] => return *pid,
+                [] => tokio::task::yield_now().await,
+                _ => panic!("one-slot initializer has multiple bootstrap waiters"),
+            }
+        }
+    }
+
+    async fn cold_initialize(
+        pool: PgPool,
+        reuse_presence: bool,
+    ) -> Result<Vec<AppliedMigration>, MigrationError> {
+        let runner = PostgresMigrationRunner::with_prefix(pool.clone(), "runtime").unwrap();
+        if reuse_presence {
+            // Reuse the same persistent SQLx statement cache after the other
+            // initializer commits, rather than relying on a first Parse.
+            let absent: (bool, bool) = sqlx::query_as(LEDGER_PRESENCE_SQL)
+                .bind(runner.ledger.ledger_table())
+                .bind(runner.ledger.meta_table())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(absent, (false, false));
+        }
+        // Match a consumer's prepared checksum preflight: warm only the ledger
+        // name, then enter the actual runner without probing the meta name.
+        let absent: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
+            .bind(runner.ledger_table())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(absent.is_none());
+        runner.run_bundle(&bundle(false)).await
+    }
+
+    #[tokio::test]
+    async fn postgres_cold_initializers_observe_one_complete_ledger_generation() {
+        assert_cold_initializers(false).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_cached_presence_observes_one_complete_ledger_generation() {
+        assert_cold_initializers(true).await;
+    }
+
+    async fn assert_cold_initializers(reuse_presence: bool) {
+        let Some(fixture) = OwnedSchema::create().await else {
+            return;
+        };
+        let app_b = format!("{}-b", fixture.name);
+        let app_a = format!("{}-a", fixture.name);
+        let pool_b = fixture.pool(&app_b).await;
+        let pool_a = fixture.pool(&app_a).await;
+        let pid_b: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&pool_b)
+            .await
+            .unwrap();
+        let pid_a: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&pool_a)
+            .await
+            .unwrap();
+        assert_ne!(pid_b, pid_a);
+        let mut controller = fixture.admin.begin().await.unwrap();
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtext('runtime_schema_migrations'), \
+                                        hashtext('ledger-bootstrap-v1'))",
+        )
+        .execute(&mut *controller)
+        .await
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut init_b = tokio::spawn(cold_initialize(pool_b.clone(), reuse_presence));
+        let waiting_b = tokio::time::timeout_at(
+            deadline,
+            wait_for_bootstrap(&fixture.admin, &app_b, "runtime_schema_migrations"),
+        )
+        .await;
+        if !waiting_b.as_ref().is_ok_and(|pid| *pid == pid_b) {
+            init_b.abort();
+            controller.rollback().await.unwrap();
+            panic!("B did not wait on its original backend: {waiting_b:?}");
+        }
+        let mut init_a = tokio::spawn(cold_initialize(pool_a.clone(), reuse_presence));
+        let waiting_a = tokio::time::timeout_at(
+            deadline,
+            wait_for_bootstrap(&fixture.admin, &app_a, "runtime_schema_migrations"),
+        )
+        .await;
+        if !waiting_a.as_ref().is_ok_and(|pid| *pid == pid_a) {
+            init_a.abort();
+            init_b.abort();
+            controller.rollback().await.unwrap();
+            panic!("A did not wait on its original backend: {waiting_a:?}");
+        }
+        controller.commit().await.unwrap();
+        let initialized =
+            tokio::time::timeout_at(deadline, async { tokio::join!(&mut init_b, &mut init_a) })
+                .await;
+        let (b, a) = match initialized {
+            Ok(results) => results,
+            Err(error) => {
+                init_b.abort();
+                init_a.abort();
+                panic!("cold initialization deadline exceeded: {error}");
+            }
+        };
+        let b = b.unwrap().unwrap();
+        let a = a.unwrap().unwrap();
+        assert_eq!(b.len() + a.len(), 1, "one migration receipt is published");
+        let runner = PostgresMigrationRunner::with_prefix(pool_a.clone(), "runtime").unwrap();
+        runner.verify_bundle(&bundle(false)).await.unwrap();
+        pool_a.close().await;
+        pool_b.close().await;
+        fixture.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_actual_partial_ledgers_are_never_bootstrapped_or_repaired() {
+        let Some(fixture) = OwnedSchema::create().await else {
+            return;
+        };
+        let pool = fixture.pool("foundation-ledger-partial").await;
+        for (prefix, ledger_exists) in [("ledger_only", true), ("meta_only", false)] {
+            let schema = LedgerSchema::with_prefix(prefix).unwrap();
+            let statements = schema.create_statements(DIALECT);
+            let selected = if ledger_exists {
+                &statements[..1]
+            } else {
+                &statements[1..]
+            };
+            for statement in selected {
+                sqlx::raw_sql(AssertSqlSafe(statement.as_str()))
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            let runner = PostgresMigrationRunner::with_prefix(pool.clone(), prefix).unwrap();
+            for error in [
+                runner.run_bundle(&bundle(false)).await.unwrap_err(),
+                runner.verify_bundle(&bundle(false)).await.unwrap_err(),
+            ] {
+                assert!(matches!(error, MigrationError::IncompleteLedger {
+                    ledger_exists: actual_ledger, meta_exists: actual_meta, ..
+                } if actual_ledger == ledger_exists && actual_meta != ledger_exists));
+            }
+            let actual: Vec<(String,)> = sqlx::query_as(
+                "SELECT relations.relname::text FROM pg_catalog.pg_class AS relations \
+                 JOIN pg_catalog.pg_namespace AS namespaces ON namespaces.oid = relations.relnamespace \
+                 WHERE namespaces.nspname = $1 AND relations.relname::text IN ($2, $3)",
+            ).bind(&fixture.name).bind(schema.ledger_table()).bind(schema.meta_table())
+                .fetch_all(&fixture.admin).await.unwrap();
+            assert_eq!(
+                actual.len(),
+                1,
+                "a genuine partial generation stays unchanged"
+            );
+            assert_eq!(
+                actual[0].0,
+                if ledger_exists {
+                    schema.ledger_table()
+                } else {
+                    schema.meta_table()
+                }
+            );
+        }
+        pool.close().await;
+        fixture.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_presence_preserves_unquoted_folding_and_identifier_truncation() {
+        let Some(fixture) = OwnedSchema::create().await else {
+            return;
+        };
+        let pool = fixture.pool("foundation-ledger-identifiers").await;
+        // The second meta name is 64 ASCII bytes. PostgreSQL truncates it to
+        // 63, while the ledger name remains distinct and fits in full.
+        for prefix in ["MixedCase".to_string(), format!("Long{}", "x".repeat(37))] {
+            let runner = PostgresMigrationRunner::with_prefix(pool.clone(), &prefix).unwrap();
+            assert_eq!(runner.run_bundle(&bundle(false)).await.unwrap().len(), 1);
+            assert!(runner.run_bundle(&bundle(false)).await.unwrap().is_empty());
+            runner.verify_bundle(&bundle(false)).await.unwrap();
+            assert_presence(
+                &pool,
+                runner.ledger.ledger_table(),
+                runner.ledger.meta_table(),
+                (true, true),
+            )
+            .await;
+        }
+        pool.close().await;
+        fixture.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_presence_preserves_search_path_shadowing_and_relation_kinds() {
+        let Some(back) = OwnedSchema::create().await else {
+            return;
+        };
+        let front = OwnedSchema::create().await.unwrap();
+        let back_pool = back.pool("foundation-ledger-path-back").await;
+        let runner = PostgresMigrationRunner::with_prefix(back_pool.clone(), "path").unwrap();
+        runner.run_bundle(&bundle(false)).await.unwrap();
+        let front_pool = front.pool("foundation-ledger-path-front").await;
+        // Same-name relations outside the search path must not leak through
+        // the catalog candidate array; implicit pg_catalog remains visible.
+        assert_presence(
+            &front_pool,
+            "path_schema_migrations",
+            "path_schema_migrations_meta",
+            (false, false),
+        )
+        .await;
+        assert_presence(&front_pool, "pg_class", "pg_namespace", (true, true)).await;
+
+        sqlx::raw_sql(AssertSqlSafe(format!(
+            "CREATE VIEW {}.path_schema_migrations_meta AS \
+             SELECT 999::bigint AS ledger_version",
+            front.name
+        )))
+        .execute(&front.admin)
+        .await
+        .unwrap();
+        let shadow_path = format!("{},{}", front.name, back.name);
+        let shadow_pool = front
+            .pool_on_path("foundation-ledger-shadow", &shadow_path)
+            .await;
+        assert_presence(
+            &shadow_pool,
+            "path_schema_migrations",
+            "path_schema_migrations_meta",
+            (true, true),
+        )
+        .await;
+        let shadow = PostgresMigrationRunner::with_prefix(shadow_pool.clone(), "path").unwrap();
+        assert!(matches!(
+            shadow.verify_bundle(&bundle(false)).await,
+            Err(MigrationError::LedgerVersionMismatch { found: 999, .. })
+        ));
+        // Each name resolves independently: the ledger came from the later
+        // schema above. Sequences and views also count as relations, matching
+        // the original to_regclass probe rather than filtering to tables.
+        sqlx::raw_sql(AssertSqlSafe(format!(
+            "CREATE SEQUENCE {}.path_schema_migrations",
+            front.name
+        )))
+        .execute(&front.admin)
+        .await
+        .unwrap();
+        assert_presence(
+            &front_pool,
+            "path_schema_migrations",
+            "path_schema_migrations_meta",
+            (true, true),
+        )
+        .await;
+        let valid_path = format!("{},{}", back.name, front.name);
+        let valid_pool = back
+            .pool_on_path("foundation-ledger-valid-path", &valid_path)
+            .await;
+        PostgresMigrationRunner::with_prefix(valid_pool.clone(), "path")
+            .unwrap()
+            .verify_bundle(&bundle(false))
+            .await
+            .unwrap();
+        valid_pool.close().await;
+        shadow_pool.close().await;
+        front_pool.close().await;
+        back_pool.close().await;
+        front.cleanup().await;
+        back.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_presence_uses_catalog_operators_with_catalog_last_on_the_path() {
+        let Some(fixture) = OwnedSchema::create().await else {
+            return;
+        };
+        let pool = fixture.pool("foundation-ledger-before-operators").await;
+        let runner = PostgresMigrationRunner::with_prefix(pool.clone(), "operator_probe").unwrap();
+        runner.run_bundle(&bundle(false)).await.unwrap();
+        sqlx::raw_sql(AssertSqlSafe(format!(
+            "CREATE FUNCTION {schema}.name_equal(pg_catalog.name, pg_catalog.name) \
+                 RETURNS boolean LANGUAGE SQL IMMUTABLE AS 'SELECT false'; \
+             CREATE OPERATOR {schema}.= \
+                 (LEFTARG = pg_catalog.name, RIGHTARG = pg_catalog.name, \
+                  PROCEDURE = {schema}.name_equal); \
+             CREATE FUNCTION {schema}.oid_equal(pg_catalog.oid, pg_catalog.oid) \
+                 RETURNS boolean LANGUAGE SQL IMMUTABLE AS 'SELECT false'; \
+             CREATE OPERATOR {schema}.= \
+                 (LEFTARG = pg_catalog.oid, RIGHTARG = pg_catalog.oid, \
+                  PROCEDURE = {schema}.oid_equal); \
+             CREATE COLLATION {schema}.\"C\" FROM pg_catalog.\"POSIX\"",
+            schema = fixture.name
+        )))
+        .execute(&fixture.admin)
+        .await
+        .unwrap();
+        let path = format!("{},pg_catalog", fixture.name);
+        let shadow = fixture
+            .pool_on_path("foundation-ledger-operators", &path)
+            .await;
+        // Prove that ordinary unqualified comparisons resolve to the hostile
+        // operators, while the presence probe still uses catalog equality.
+        let ordinary: (bool, bool) = sqlx::query_as(
+            "SELECT 'same'::pg_catalog.name = 'same'::pg_catalog.name, \
+                    1::pg_catalog.oid = 1::pg_catalog.oid",
+        )
+        .fetch_one(&shadow)
+        .await
+        .unwrap();
+        assert_eq!(ordinary, (false, false));
+        assert_presence(
+            &shadow,
+            runner.ledger.ledger_table(),
+            runner.ledger.meta_table(),
+            (true, true),
+        )
+        .await;
+        shadow.close().await;
+        pool.close().await;
+        fixture.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_presence_keeps_an_uninitialized_temp_path_read_only() {
+        let Some(fixture) = OwnedSchema::create().await else {
+            return;
+        };
+        let persistent = fixture.pool("foundation-ledger-persistent").await;
+        PostgresMigrationRunner::with_prefix(persistent.clone(), "temp_path")
+            .unwrap()
+            .run_bundle(&bundle(false))
+            .await
+            .unwrap();
+        let path = format!("pg_temp,{}", fixture.name);
+        let pool = fixture.pool_on_path("foundation-ledger-temp", &path).await;
+        let initial_temp: i64 = sqlx::query_scalar("SELECT pg_my_temp_schema()::bigint")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(initial_temp, 0);
+        let runner = PostgresMigrationRunner::with_prefix(pool.clone(), "temp_path").unwrap();
+        runner.verify_bundle(&bundle(false)).await.unwrap();
+        assert_presence(
+            &pool,
+            "temp_path_schema_migrations",
+            "temp_path_schema_migrations_meta",
+            (true, true),
+        )
+        .await;
+        assert_presence(&pool, "absent_ledger", "absent_meta", (false, false)).await;
+        let after_verify: i64 = sqlx::query_scalar("SELECT pg_my_temp_schema()::bigint")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            after_verify, 0,
+            "presence checks must not initialize pg_temp"
+        );
+
+        sqlx::raw_sql(AssertSqlSafe(
+            "CREATE TEMP SEQUENCE temp_path_schema_migrations; \
+             CREATE TEMP VIEW temp_path_schema_migrations_meta AS \
+             SELECT 888::bigint AS ledger_version",
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_presence(
+            &pool,
+            "temp_path_schema_migrations",
+            "temp_path_schema_migrations_meta",
+            (true, true),
+        )
+        .await;
+        assert!(matches!(
+            runner.verify_bundle(&bundle(false)).await,
+            Err(MigrationError::LedgerVersionMismatch { found: 888, .. })
+        ));
+        pool.close().await;
+        persistent.close().await;
+        fixture.cleanup().await;
     }
 
     /// Cause/effect decision table: an application verifier cannot bootstrap a

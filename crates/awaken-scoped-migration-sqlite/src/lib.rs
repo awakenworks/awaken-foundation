@@ -640,10 +640,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_ledger_written_here_is_accepted_by_the_sqlx_runner() {
-        // Cause/effect rule: a file database migrated by this rusqlite runner ->
-        // the sqlx runner over the same file verifies the bundle, re-applies
-        // nothing, and records no second receipt; checksums and ledger layout are
-        // shared, so switching drivers never re-runs or rejects a migration.
+        // Security/driver decision table on one real file and original ledger:
+        // S0 both actual connections report the same engine >=3.54.1; this
+        // witnesses the patched shared native library, not just manifest text.
+        // S1 sync applies two -> async verifies/replays with zero extra receipts.
+        // S2 async body creates a table then fails -> rollback preserves both
+        // receipts and no table; the original single-applier guard is released.
+        // S3 valid async successor applies once -> sync reopen accepts all three
+        // unchanged checksums, with no second receipt or migration mechanism.
         let path = std::env::temp_dir().join(format!(
             "awaken-scoped-migration-cross-driver-{}.sqlite",
             std::process::id()
@@ -651,6 +655,10 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         {
             let conn = Connection::open(&path).unwrap();
+            assert!(
+                rusqlite::version_number() >= 3_054_001,
+                "S0 safe engine floor"
+            );
             SqliteMigrationRunner::with_prefix("awaken")
                 .unwrap()
                 .run_bundle(&conn, &bundle())
@@ -661,6 +669,15 @@ mod tests {
             .connect(&format!("sqlite://{}", path.display()))
             .await
             .unwrap();
+        let engine: String = sqlx::query_scalar("SELECT sqlite_version()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            engine,
+            rusqlite::version(),
+            "S0 same linked engine in both drivers"
+        );
         let runner = awaken_scoped_migration::sqlite::SqliteMigrationRunner::with_prefix(
             pool.clone(),
             "awaken",
@@ -673,7 +690,68 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(receipts, 2);
+
+        let mut migrations = bundle().migrations().to_vec();
+        migrations.push(
+            Migration::new(
+                3,
+                "controlled rollback",
+                "CREATE TABLE c (id TEXT PRIMARY KEY); THIS IS NOT VALID SQL",
+            )
+            .unwrap(),
+        );
+        let broken = MigrationBundle::new("runtime.core", migrations).unwrap();
+        assert!(
+            matches!(
+                runner.run_bundle(&broken).await.unwrap_err(),
+                MigrationError::Backend {
+                    operation: "sqlite_migration_apply",
+                    ..
+                }
+            ),
+            "S2 original error family"
+        );
+        let table_c: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='c')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!table_c, "S2 no partial table");
+        let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM awaken_schema_migrations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(receipts, 2, "S2 no partial receipt");
+
+        let mut migrations = bundle().migrations().to_vec();
+        migrations
+            .push(Migration::new(3, "create c", "CREATE TABLE c (id TEXT PRIMARY KEY)").unwrap());
+        let extended = MigrationBundle::new("runtime.core", migrations).unwrap();
+        let applied = runner.run_bundle(&extended).await.unwrap();
+        assert_eq!(applied.len(), 1, "S3 exact successor only");
+        assert_eq!(applied[0].version, 3);
+        runner.verify_bundle(&extended).await.unwrap();
+        assert!(runner.run_bundle(&extended).await.unwrap().is_empty());
         pool.close().await;
+        {
+            let conn = Connection::open(&path).unwrap();
+            assert!(
+                SqliteMigrationRunner::with_prefix("awaken")
+                    .unwrap()
+                    .run_bundle(&conn, &extended)
+                    .unwrap()
+                    .is_empty(),
+                "S3 sync accepts async receipts"
+            );
+            assert!(table_exists(&conn, "c"));
+            let receipts: i64 = conn
+                .query_row("SELECT COUNT(*) FROM awaken_schema_migrations", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(receipts, 3, "S3 no second receipt");
+        }
         let _ = std::fs::remove_file(&path);
     }
 }
