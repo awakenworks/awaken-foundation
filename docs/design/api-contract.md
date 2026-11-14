@@ -98,7 +98,7 @@ use awaken_api_contract::{
 };
 
 let schema = QuerySchema::new()
-    .allow_filter_field("project_id", [FilterOperator::Eq, FilterOperator::In])
+    .allow_string_filter_field("project_id", [FilterOperator::Eq, FilterOperator::In])
     .allow_filter_field(
         "completed_at",
         [
@@ -121,6 +121,20 @@ let schema = QuerySchema::new()
 The parser validates fields and operators against this schema. Unknown fields are
 errors, not no-ops, so clients cannot discover or exploit storage columns by
 guessing names.
+
+`allow_filter_field` keeps the existing automatic URL scalar parsing: booleans,
+numbers and `null` become their typed values. For textual search or identifiers,
+`allow_string_filter_field` opts that field into exact string values instead.
+`001`, `1e3`, a large integer, `true`, `null`, Unicode and whitespace retain their
+original decoded URL bytes; no consumer should reconstruct them from a float or
+rewrite the parsed AST. `in`/`not_in` retain the original comma token boundaries,
+including empty or whitespace tokens, but each token is a string. Registering
+the same field again replaces both its operators and its URL parsing mode.
+
+This mode adds no wire syntax and is not an AST type validator. Already-typed
+`FilterNode` validation still checks the same field/operator allowlist. The AST,
+SQL compiler, parameter binding, sorting, pagination and authorization boundaries
+remain unchanged; the consumer declares which fields have textual meaning.
 
 ## Response shape
 

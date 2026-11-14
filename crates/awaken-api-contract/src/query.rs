@@ -161,11 +161,23 @@ impl SortClause {
 /// Allowlist for one resource or read-model query surface.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct QuerySchema {
-    filter_fields: BTreeMap<String, BTreeSet<FilterOperator>>,
+    filter_fields: BTreeMap<String, FilterFieldRule>,
     sortable_fields: BTreeSet<String>,
     groupable_fields: BTreeSet<String>,
     default_sort: Vec<SortClause>,
     page: PaginationConfig,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FilterValueMode {
+    Auto,
+    String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FilterFieldRule {
+    operators: BTreeSet<FilterOperator>,
+    value_mode: FilterValueMode,
 }
 
 impl QuerySchema {
@@ -182,12 +194,38 @@ impl QuerySchema {
 
     #[must_use]
     pub fn allow_filter_field(
-        mut self,
+        self,
         field: impl Into<String>,
         operators: impl IntoIterator<Item = FilterOperator>,
     ) -> Self {
-        self.filter_fields
-            .insert(field.into(), operators.into_iter().collect());
+        self.allow_filter_field_with_mode(field, operators, FilterValueMode::Auto)
+    }
+
+    /// Preserve each URL value as a string, including numeric/boolean-looking
+    /// text. In/NotIn keep the existing comma split, with string elements.
+    /// This controls URL parsing, not validation of already-typed filter ASTs.
+    #[must_use]
+    pub fn allow_string_filter_field(
+        self,
+        field: impl Into<String>,
+        operators: impl IntoIterator<Item = FilterOperator>,
+    ) -> Self {
+        self.allow_filter_field_with_mode(field, operators, FilterValueMode::String)
+    }
+
+    fn allow_filter_field_with_mode(
+        mut self,
+        field: impl Into<String>,
+        operators: impl IntoIterator<Item = FilterOperator>,
+        value_mode: FilterValueMode,
+    ) -> Self {
+        self.filter_fields.insert(
+            field.into(),
+            FilterFieldRule {
+                operators: operators.into_iter().collect(),
+                value_mode,
+            },
+        );
         self
     }
 
@@ -251,10 +289,10 @@ impl QuerySchema {
             FilterNode::Condition {
                 field, operator, ..
             } => {
-                let Some(operators) = self.filter_fields.get(field) else {
+                let Some(rule) = self.filter_fields.get(field) else {
                     return Err(QueryError::UnsupportedFilterField(field.clone()));
                 };
-                if !operators.contains(operator) {
+                if !rule.operators.contains(operator) {
                     return Err(QueryError::OperatorNotAllowed {
                         field: field.clone(),
                         operator: *operator,
@@ -338,10 +376,14 @@ where
             offset = Some(parse_page_offset(value)?);
         } else if key.starts_with("filter") {
             let (field, operator) = parse_filter_key(key)?;
+            let value_mode = schema
+                .filter_fields
+                .get(&field)
+                .map_or(FilterValueMode::Auto, |rule| rule.value_mode);
             filters.push(FilterNode::Condition {
                 field,
                 operator,
-                value: parse_filter_value(value, operator),
+                value: parse_filter_value(value, operator, value_mode),
             });
         }
     }
@@ -396,11 +438,19 @@ fn bracket_parts(key: &str) -> Option<Vec<&str>> {
     }
 }
 
-fn parse_filter_value(value: &str, operator: FilterOperator) -> FilterValue {
+fn parse_filter_value(
+    value: &str,
+    operator: FilterOperator,
+    value_mode: FilterValueMode,
+) -> FilterValue {
+    let parse = |raw: &str| match value_mode {
+        FilterValueMode::Auto => parse_scalar(raw),
+        FilterValueMode::String => FilterScalar::String(raw.to_owned()),
+    };
     if matches!(operator, FilterOperator::In | FilterOperator::NotIn) {
-        return FilterValue::List(value.split(',').map(parse_scalar).collect());
+        return FilterValue::List(value.split(',').map(parse).collect());
     }
-    FilterValue::Scalar(parse_scalar(value))
+    FilterValue::Scalar(parse(value))
 }
 
 fn parse_scalar(value: &str) -> FilterScalar {
@@ -737,6 +787,156 @@ mod tests {
                     FilterScalar::Null,
                 ])
             }
+        );
+    }
+
+    #[test]
+    fn explicit_string_fields_preserve_lexical_values_beside_auto_fields() {
+        // S1 original Auto scalar/list cases above remain unchanged. S2 an
+        // explicitly textual search/id must preserve raw lexical information,
+        // including forms that a float/bool/null conversion would destroy.
+        // S4 mode belongs to one field, not the whole request. S7 the same AST
+        // serde roundtrip retains those strings for existing cursor consumers.
+        let schema = QuerySchema::new()
+            .allow_string_filter_field("text", [FilterOperator::Contains])
+            .allow_string_filter_field("id", [FilterOperator::Eq])
+            .allow_filter_field("count", [FilterOperator::Eq]);
+        for raw in [
+            "001",
+            "1e3",
+            "900719925474099312345",
+            "true",
+            "false",
+            "null",
+            "审阅١٢",
+            " x ",
+            "",
+        ] {
+            let query = parse_list_query(
+                [
+                    ("filter[text][contains]", raw),
+                    ("filter[id]", raw),
+                    ("filter[count]", "42"),
+                ],
+                &schema,
+            )
+            .unwrap();
+            let FilterNode::Group { conditions, .. } = &query.filter else {
+                panic!("expected group");
+            };
+            for (index, field, operator) in [
+                (0, "text", FilterOperator::Contains),
+                (1, "id", FilterOperator::Eq),
+            ] {
+                assert_eq!(
+                    conditions[index],
+                    FilterNode::Condition {
+                        field: field.into(),
+                        operator,
+                        value: FilterValue::Scalar(FilterScalar::String(raw.into()))
+                    },
+                    "S2 {raw:?}"
+                );
+            }
+            assert_eq!(
+                conditions[2],
+                FilterNode::Condition {
+                    field: "count".into(),
+                    operator: FilterOperator::Eq,
+                    value: FilterValue::Scalar(FilterScalar::Number(42.0))
+                },
+                "S4"
+            );
+            let decoded: ListQuery =
+                serde_json::from_str(&serde_json::to_string(&query).unwrap()).unwrap();
+            assert_eq!(decoded, query, "S7 {raw:?}");
+        }
+    }
+
+    #[test]
+    fn string_lists_keep_the_original_comma_tokens_without_scalar_coercion() {
+        // S3 In/NotIn keep the original split, including empty/space tokens;
+        // no escaping, trimming, numeric conversion or second grammar is added.
+        let schema = QuerySchema::new()
+            .allow_string_filter_field("id", [FilterOperator::In, FilterOperator::NotIn]);
+        let raw = "001,1e3,900719925474099312345,true,null,审阅, x ,,";
+        for (key, operator) in [
+            ("filter[id][in]", FilterOperator::In),
+            ("filter[id][not_in]", FilterOperator::NotIn),
+        ] {
+            let query = parse_list_query([(key, raw)], &schema).unwrap();
+            let FilterNode::Group { conditions, .. } = query.filter else {
+                panic!("expected group");
+            };
+            assert_eq!(
+                conditions,
+                [FilterNode::Condition {
+                    field: "id".into(),
+                    operator,
+                    value: FilterValue::List(
+                        [
+                            "001",
+                            "1e3",
+                            "900719925474099312345",
+                            "true",
+                            "null",
+                            "审阅",
+                            " x ",
+                            "",
+                            ""
+                        ]
+                        .map(|value| FilterScalar::String(value.into()))
+                        .into()
+                    )
+                }],
+                "S3 {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn replacing_a_field_replaces_its_mode_and_operators_without_expanding_the_allowlist() {
+        // S5 one rule is authoritative: Auto->String and String->Auto each
+        // replace BOTH mode/operators, with no sticky second marker registry.
+        // S6 opt-in never admits a foreign field or an unoffered operator.
+        let schema = QuerySchema::new()
+            .allow_filter_field("id", [FilterOperator::Eq])
+            .allow_string_filter_field("id", [FilterOperator::Contains]);
+        assert!(matches!(
+            parse_list_query([("filter[id]", "001")], &schema),
+            Err(QueryError::OperatorNotAllowed { .. })
+        ));
+        let string_query = parse_list_query([("filter[id][contains]", "001")], &schema).unwrap();
+        assert!(
+            serde_json::to_string(&string_query)
+                .unwrap()
+                .contains("\"value\":\"001\"")
+        );
+        let auto = schema.allow_filter_field("id", [FilterOperator::Eq]);
+        assert!(matches!(
+            parse_list_query([("filter[id][contains]", "001")], &auto),
+            Err(QueryError::OperatorNotAllowed { .. })
+        ));
+        let query = parse_list_query([("filter[id]", "001")], &auto).unwrap();
+        let FilterNode::Group { conditions, .. } = query.filter else {
+            panic!("expected group");
+        };
+        assert_eq!(
+            conditions,
+            [FilterNode::Condition {
+                field: "id".into(),
+                operator: FilterOperator::Eq,
+                value: FilterValue::Scalar(FilterScalar::Number(1.0))
+            }],
+            "S5 Auto restored"
+        );
+        assert_eq!(
+            parse_list_query([("filter[foreign]", "001")], &auto).unwrap_err(),
+            QueryError::UnsupportedFilterField("foreign".into())
+        );
+        assert_eq!(
+            parse_list_query([("filter[id][between]", "001")], &auto).unwrap_err(),
+            QueryError::UnsupportedFilterOperator("between".into())
         );
     }
 
